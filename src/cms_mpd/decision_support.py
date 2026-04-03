@@ -37,6 +37,8 @@ RECOMMENDATION_SCHEMA_COLUMNS = [
     "stability_score",
     "evidence_gaps",
     "feature_version",
+    "contract_year",
+    "benefit_design",
 ]
 
 CONFIDENCE_SCORE_MAP = {
@@ -285,6 +287,8 @@ def recommendations_to_dataframe(
             "stability_score": round(float(recommendation.fit_metrics.stability_score), 2),
             "evidence_gaps": evidence_gaps,
             "feature_version": recommendation.feature_version,
+            "contract_year": recommendation.contract_year,
+            "benefit_design": recommendation.benefit_design,
             "selected_channel_mix": recommendation.best_channel_mix,
             "network_flag": recommendation.network_flag,
             "nearest_preferred_distance_miles": recommendation.nearest_preferred_distance_miles,
@@ -309,6 +313,8 @@ def summarize_feature_coverage(
             1 for item in all_recommendations if item.nearest_preferred_distance_miles is not None
         ),
         "plans_with_full_coverage": sum(1 for item in eligible_recommendations if item.coverage_status == "full"),
+        "contract_years": sorted({int(item.contract_year) for item in all_recommendations if item.contract_year is not None}),
+        "benefit_designs": sorted({str(item.benefit_design) for item in all_recommendations if item.benefit_design}),
     }
 
 
@@ -349,6 +355,8 @@ def create_run_audit(
             "ml_score",
             "confidence_band",
             "stability_score",
+            "contract_year",
+            "benefit_design",
         ]
         top_k = serialize_nested_columns(recommendations[export_cols].head(10)).to_dict("records")
     return RecommendationAudit(

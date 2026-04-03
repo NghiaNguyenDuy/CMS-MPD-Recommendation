@@ -174,7 +174,7 @@ def _sample_recommendation(
         st_flag=False,
         ql_flag=False,
         insulin_flag=True,
-        coverage_gap_flag=uncovered_drug_count > 0,
+        coverage_gap_flag=False,
         coverage_status="covered" if uncovered_drug_count == 0 else "excluded",
         pricing_status="priced",
         coverage_phases=["initial_coverage"],
@@ -231,8 +231,10 @@ def _sample_recommendation(
         nearest_preferred_distance_miles=nearest_distance_miles,
         service_area_eligible=not comparison_only,
         comparison_only=comparison_only,
-        feature_version="research_v2",
+        feature_version="research_v3",
         drug_breakdowns=[drug_breakdown],
+        contract_year=2025,
+        benefit_design="2025_redesign",
     )
 
 
@@ -392,6 +394,8 @@ def test_decision_support_exports_and_counselor_note():
     assert eligible_frame.iloc[0]["recommendation_tier"] == "Ready to shortlist"
     assert comparison_frame.iloc[0]["eligibility_status"].startswith("Comparison only")
     assert bool(comparison_frame.iloc[0]["comparison_only"]) is True
+    assert eligible_frame.iloc[0]["contract_year"] == 2025
+    assert eligible_frame.iloc[0]["benefit_design"] == "2025_redesign"
 
     side_by_side = build_side_by_side_frame(combined, selected_plan_keys=["P1", "P3"])
     assert list(side_by_side.columns) == ["Metric", "Alpha Choice", "Gamma Nearby"]
@@ -400,6 +404,8 @@ def test_decision_support_exports_and_counselor_note():
     feature_coverage = summarize_feature_coverage(eligible_recommendations, comparison_recommendations)
     assert feature_coverage["candidate_plans"] == 3
     assert feature_coverage["comparison_only_plans"] == 1
+    assert feature_coverage["contract_years"] == [2025]
+    assert feature_coverage["benefit_designs"] == ["2025_redesign"]
 
     profile = ProfileInput(
         persona="Counselor",
@@ -443,7 +449,7 @@ def test_decision_support_exports_and_counselor_note():
     assert audit.run_id == "run123"
     assert audit.data_snapshot == "2025-Q3"
     assert len(audit.top_k_outputs) == 3
-    assert {"PLAN_KEY", "PLAN_NAME", "eligibility_status"}.issubset(audit.top_k_outputs[0])
+    assert {"PLAN_KEY", "PLAN_NAME", "eligibility_status", "contract_year", "benefit_design"}.issubset(audit.top_k_outputs[0])
     assert "Alpha Choice" in note
     assert "comparison-only" in note
     assert any("Hybrid reranker score not available" in gap for gap in gaps)

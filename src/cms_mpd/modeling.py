@@ -29,6 +29,8 @@ BASE_SCENARIO_COUNT = {
     "demo": 6,
     "full": 12,
 }
+EVALUATION_SPLIT_SEED = 42
+EVALUATION_TEST_FRACTION = 0.3
 
 MODEL_NUMERIC_COLUMNS = [
     "current_rules_rank",
@@ -763,6 +765,8 @@ def _recommendations_to_feature_rows(
             "excluded_rate": float(feature_row.get("excluded_rate") or 0.0),
             "deductible": float(feature_row.get("deductible") or 0.0),
             "served_counties": float(feature_row.get("served_counties") or 0.0),
+            "contract_year": float(recommendation.contract_year or 0.0),
+            "benefit_design": recommendation.benefit_design,
             "feature_version": recommendation.feature_version,
         }
         rows.append(row)
@@ -1131,6 +1135,32 @@ def _summarize_metric_frames(metric_frames: dict[str, list[dict[str, float]]]) -
     return summary
 
 
+def _split_frame_by_scenario(
+    frame: pd.DataFrame,
+    *,
+    test_fraction: float = EVALUATION_TEST_FRACTION,
+    seed: int = EVALUATION_SPLIT_SEED,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+    scenario_ids = sorted(frame["scenario_id"].dropna().astype(str).unique().tolist())
+    if len(scenario_ids) < 2:
+        raise ValueError("Need at least two scenarios for held-out evaluation.")
+
+    shuffled = np.array(scenario_ids, dtype=object)
+    np.random.default_rng(seed).shuffle(shuffled)
+    test_count = max(1, int(math.ceil(len(shuffled) * test_fraction)))
+    if test_count >= len(shuffled):
+        test_count = len(shuffled) - 1
+    test_scenarios = sorted(str(item) for item in shuffled[:test_count].tolist())
+    test_scenario_set = set(test_scenarios)
+    scenario_labels = frame["scenario_id"].astype(str)
+    test_frame = frame.loc[scenario_labels.isin(test_scenario_set)].copy()
+    train_frame = frame.loc[~scenario_labels.isin(test_scenario_set)].copy()
+    if train_frame.empty or test_frame.empty:
+        raise ValueError("Unable to create non-empty train/test scenario splits for evaluation.")
+    train_scenarios = sorted(train_frame["scenario_id"].astype(str).unique().tolist())
+    return train_frame, test_frame, train_scenarios, test_scenarios
+
+
 def _collect_system_metrics(
     frame: pd.DataFrame,
     orderings_by_system: dict[str, str],
@@ -1198,24 +1228,29 @@ def evaluate_hybrid_reranker(
     if frame.empty:
         raise ValueError("No rows available for evaluation after scenario-bundle filtering.")
 
-    linear_artifact_path = _artifact_path(active_config, LINEAR_MODEL_TYPE)
-    tree_artifact_path = artifact_path or _artifact_path(active_config, TREE_MODEL_TYPE)
-    if not linear_artifact_path.exists():
-        train_hybrid_reranker(active_config, dataset_path=dataset, output_path=linear_artifact_path, model_type=LINEAR_MODEL_TYPE)
-    if not baseline_only and not tree_artifact_path.exists():
-        train_hybrid_reranker(active_config, dataset_path=dataset, output_path=tree_artifact_path, model_type=TREE_MODEL_TYPE)
+    train_frame, test_frame, train_scenarios, test_scenarios = _split_frame_by_scenario(frame)
+    evaluation_frame = test_frame.copy()
 
-    linear_artifact = load_hybrid_reranker(linear_artifact_path)
-    frame["predicted_linear_score"] = linear_artifact.predict(frame)
-    if not baseline_only:
-        tree_artifact = load_hybrid_reranker(tree_artifact_path)
-        frame["predicted_tree_score"] = tree_artifact.predict(frame)
+    linear_artifact = _fit_linear_artifact(train_frame, active_config, "full", alpha=5.0)
+    evaluation_frame["predicted_linear_score"] = linear_artifact.predict(evaluation_frame)
+    if artifact_path is not None:
+        logger.info("evaluation uses held-out train/test fitting and does not reuse artifact=%s", artifact_path)
 
     ablation_predictions: dict[str, str] = {}
     if not baseline_only:
+        tree_artifact = _fit_tree_artifact(
+            train_frame,
+            active_config,
+            "full",
+            learning_rate=0.12,
+            n_estimators=40,
+            max_depth=3,
+            min_samples_leaf=5,
+        )
+        evaluation_frame["predicted_tree_score"] = tree_artifact.predict(evaluation_frame)
         for subset in ("cost_only", "cost_plus_restrictions", "cost_plus_restrictions_network", "full"):
             ablation_artifact = _fit_tree_artifact(
-                frame,
+                train_frame,
                 active_config,
                 subset,
                 learning_rate=0.12,
@@ -1224,7 +1259,7 @@ def evaluate_hybrid_reranker(
                 min_samples_leaf=5,
             )
             column_name = f"predicted_ablation_{subset}"
-            frame[column_name] = ablation_artifact.predict(frame)
+            evaluation_frame[column_name] = ablation_artifact.predict(evaluation_frame)
             ablation_predictions[subset] = column_name
 
     orderings_by_system = {
@@ -1241,12 +1276,15 @@ def evaluate_hybrid_reranker(
             }
         )
 
-    systems_summary, bundle_summary = _collect_system_metrics(frame, orderings_by_system)
+    systems_summary, bundle_summary = _collect_system_metrics(evaluation_frame, orderings_by_system)
     rules_metrics = systems_summary["rules_only"]
     comparison_target = systems_summary["tree_reranker"] if not baseline_only else systems_summary["linear_reranker"]
     summary: dict[str, Any] = {
         "dataset_schema_version": DATASET_SCHEMA_VERSION,
         "weak_label_version": WEAK_LABEL_VERSION,
+        "evaluation_mode": "held_out_by_scenario",
+        "split_seed": EVALUATION_SPLIT_SEED,
+        "test_fraction": EVALUATION_TEST_FRACTION,
         "systems": systems_summary,
         "scenario_bundle_metrics": bundle_summary,
         "acceptance": {
@@ -1256,6 +1294,12 @@ def evaluate_hybrid_reranker(
         },
         "dataset_rows": int(len(frame)),
         "scenario_count": int(frame["scenario_id"].nunique()),
+        "train_rows": int(len(train_frame)),
+        "test_rows": int(len(evaluation_frame)),
+        "train_scenario_count": int(len(train_scenarios)),
+        "test_scenario_count": int(len(test_scenarios)),
+        "train_scenarios": train_scenarios,
+        "test_scenarios": test_scenarios,
     }
 
     report_path = output_path or _evaluation_report_path(active_config, TREE_MODEL_TYPE if not baseline_only else LINEAR_MODEL_TYPE)

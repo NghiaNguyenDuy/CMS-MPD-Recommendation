@@ -1,28 +1,20 @@
-"""Phase 1 – Coverage Gap (Donut Hole) & Catastrophic Phase Tests.
-
-Verifies that _simulate_fill_cost correctly detects phase transitions
-at CMS 2025 thresholds:
-  - Initial Coverage Limit: $5,030
-  - Catastrophic TrOOP Threshold: $8,000
-  - Coverage Gap coinsurance: 25%
-  - OOP Cap: $2,000
-"""
+"""Coverage-phase regression tests for 2025 redesign defaults and explicit 2024 mode."""
 from __future__ import annotations
 
 import pytest
 
+from cms_mpd.config import PipelineConfig
 from cms_mpd.recommend import (
     ANNUAL_OOP_CAP,
+    BENEFIT_DESIGN_2024,
+    BENEFIT_DESIGN_2025,
     CATASTROPHIC_TROOP_THRESHOLD,
     INITIAL_COVERAGE_LIMIT,
-    FillCostResult,
     _compute_catastrophic_cost,
     _compute_coverage_gap_cost,
+    _resolve_plan_benefit_design,
     _simulate_fill_cost,
 )
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────
 
 
 def _make_basis(
@@ -32,12 +24,7 @@ def _make_basis(
     days_supply: int = 30,
     is_insulin: bool = False,
     deductible_applies: bool = False,
-    is_excluded: bool = False,
-    has_prior_auth: bool = False,
-    has_step_therapy: bool = False,
-    has_quantity_limit: bool = False,
 ) -> dict:
-    """Build a minimal cost-basis dict for testing."""
     return {
         "unit_cost": unit_cost,
         "tier_family": tier_family,
@@ -45,11 +32,10 @@ def _make_basis(
         "days_supply": days_supply,
         "is_insulin": is_insulin,
         "deductible_applies": deductible_applies,
-        "is_excluded": is_excluded,
-        "has_prior_auth": has_prior_auth,
-        "has_step_therapy": has_step_therapy,
-        "has_quantity_limit": has_quantity_limit,
-        # Initial coverage cost-sharing rules (copay type=1, $25 copay)
+        "is_excluded": False,
+        "has_prior_auth": False,
+        "has_step_therapy": False,
+        "has_quantity_limit": False,
         "init_pref_cost_type": 1,
         "init_pref_cost_amt": 25.0,
         "init_pref_cost_min": None,
@@ -66,7 +52,6 @@ def _make_basis(
         "init_mail_nonpref_cost_amt": 45.0,
         "init_mail_nonpref_cost_min": None,
         "init_mail_nonpref_cost_max": None,
-        # Pre-deductible fields
         "pre_pref_cost_type": None,
         "pre_pref_cost_amt": None,
         "pre_pref_cost_min": None,
@@ -83,7 +68,6 @@ def _make_basis(
         "pre_mail_nonpref_cost_amt": None,
         "pre_mail_nonpref_cost_min": None,
         "pre_mail_nonpref_cost_max": None,
-        # Insulin fields
         "insulin_pref_copay": None,
         "insulin_nonpref_copay": None,
         "insulin_pref_mail_copay": None,
@@ -93,13 +77,11 @@ def _make_basis(
 
 def _make_channel_summary(
     *,
-    has_pref_retail: bool = True,
     pref_retail_brand_fee_30: float = 2.0,
     pref_retail_generic_fee_30: float = 1.0,
 ) -> dict:
-    """Build a minimal channel summary dict."""
     return {
-        "has_pref_retail": has_pref_retail,
+        "has_pref_retail": True,
         "has_nonpref_retail": True,
         "has_pref_mail": True,
         "has_nonpref_mail": True,
@@ -134,244 +116,185 @@ def _make_channel_summary(
     }
 
 
-# ── Unit tests for gap/catastrophic cost helpers ─────────────────────────
+class TestBenefitDesignResolution:
+    def test_auto_mode_uses_2025_redesign_for_2025_contracts(self):
+        config = PipelineConfig(snapshot_quarter="2025-Q3", benefit_design_mode="auto")
+        contract_year, design = _resolve_plan_benefit_design(2025, config)
+        assert contract_year == 2025
+        assert design == BENEFIT_DESIGN_2025
+
+    def test_auto_mode_uses_2024_standard_for_2024_contracts(self):
+        config = PipelineConfig(snapshot_quarter="2025-Q3", benefit_design_mode="auto")
+        contract_year, design = _resolve_plan_benefit_design(2024, config)
+        assert contract_year == 2024
+        assert design == BENEFIT_DESIGN_2024
+
+    def test_explicit_mode_overrides_contract_year(self):
+        config = PipelineConfig(snapshot_quarter="2025-Q3", benefit_design_mode=BENEFIT_DESIGN_2024)
+        contract_year, design = _resolve_plan_benefit_design(2025, config)
+        assert contract_year == 2025
+        assert design == BENEFIT_DESIGN_2024
 
 
-class TestCoverageGapCostHelpers:
-    """Verify _compute_coverage_gap_cost and _compute_catastrophic_cost."""
-
-    def test_gap_cost_generic_25_pct(self):
+class TestCostHelpers:
+    def test_coverage_gap_cost_is_25_percent(self):
+        assert _compute_coverage_gap_cost(200.0, "brand") == pytest.approx(50.0)
         assert _compute_coverage_gap_cost(100.0, "generic") == pytest.approx(25.0)
 
-    def test_gap_cost_brand_25_pct(self):
-        assert _compute_coverage_gap_cost(200.0, "brand") == pytest.approx(50.0)
-
-    def test_gap_cost_zero(self):
-        assert _compute_coverage_gap_cost(0.0, "generic") == 0.0
-
-    def test_catastrophic_cost_generic_copay(self):
-        # Generic: min($4.50, negotiated)
-        assert _compute_catastrophic_cost(100.0, "generic") == pytest.approx(4.50)
-
-    def test_catastrophic_cost_generic_cheaper_than_copay(self):
-        # If negotiated < $4.50, pay negotiated
-        assert _compute_catastrophic_cost(2.00, "generic") == pytest.approx(2.00)
-
-    def test_catastrophic_cost_brand_5_pct(self):
-        # Brand: max($4.50, 5% coinsurance), capped at $44
-        # $200 * 5% = $10 > $4.50 → $10
-        assert _compute_catastrophic_cost(200.0, "brand") == pytest.approx(10.0)
-
-    def test_catastrophic_cost_brand_floor(self):
-        # Brand: $50 * 5% = $2.50 < $4.50 → $4.50
-        assert _compute_catastrophic_cost(50.0, "brand") == pytest.approx(4.50)
-
-    def test_catastrophic_cost_brand_cap_at_44(self):
-        # Brand: $2000 * 5% = $100 → capped at $44
-        assert _compute_catastrophic_cost(2000.0, "brand") == pytest.approx(44.0)
+    def test_2024_catastrophic_cost_is_zero(self):
+        assert _compute_catastrophic_cost(200.0, "brand") == 0.0
+        assert _compute_catastrophic_cost(50.0, "generic") == 0.0
 
 
-# ── Phase transition tests ───────────────────────────────────────────────
-
-
-class TestInitialCoveragePhase:
-    """Fill with total drug spending below $5,030 stays in initial coverage."""
-
-    def test_initial_coverage_phase_detected(self):
-        basis = _make_basis(unit_cost=10.0)
+class Test2025RedesignDefaults:
+    def test_default_behavior_never_enters_gap_or_catastrophic(self):
+        basis = _make_basis(unit_cost=20.0)
         channel_summary = _make_channel_summary()
         result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=0.0, lis_status="none",
-            total_drug_spending_accumulated=0.0,
+            basis,
+            channel_summary,
+            "pref_retail",
+            quantity=30.0,
+            remaining_deductible=0.0,
+            oop_accumulated=500.0,
+            lis_status="none",
+            total_drug_spending_accumulated=9000.0,
         )
         assert result is not None
+        assert result.benefit_design == BENEFIT_DESIGN_2025
         assert "coverage_gap" not in result.coverage_phase
         assert "catastrophic" not in result.coverage_phase
         assert result.coverage_gap_oop == 0.0
         assert result.catastrophic_oop == 0.0
 
-    def test_total_drug_spending_tracked(self):
-        basis = _make_basis(unit_cost=10.0)
-        channel_summary = _make_channel_summary()
-        result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=0.0, lis_status="none",
-            total_drug_spending_accumulated=100.0,
-        )
-        assert result is not None
-        assert result.total_drug_spending_before == pytest.approx(100.0)
-        assert result.total_drug_spending_after > 100.0
-
-
-class TestCoverageGapPhase:
-    """Fill with total drug spending ≥ $5,030 enters coverage gap."""
-
-    def test_coverage_gap_detected(self):
+    def test_annual_oop_cap_applies_in_2025_redesign(self):
         basis = _make_basis(unit_cost=20.0)
         channel_summary = _make_channel_summary()
         result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=500.0, lis_status="none",
-            total_drug_spending_accumulated=5500.0,  # Already past $5,030
-        )
-        assert result is not None
-        assert result.coverage_phase == "coverage_gap"
-        assert result.coverage_gap_oop > 0
-        # 25% of negotiated price
-        expected_gap_cost = result.negotiated_price * 0.25
-        assert result.coverage_gap_oop == pytest.approx(expected_gap_cost)
-
-    def test_straddling_initial_to_gap(self):
-        """Fill that crosses the $5,030 threshold mid-fill."""
-        basis = _make_basis(unit_cost=10.0)
-        channel_summary = _make_channel_summary()
-        # TDS at 5000, fill adds ~302 → crosses 5030
-        result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=400.0, lis_status="none",
-            total_drug_spending_accumulated=5000.0,
-        )
-        assert result is not None
-        assert "_then_coverage_gap" in result.coverage_phase
-        assert result.coverage_gap_oop > 0
-        # Gap portion = tds_after - 5030
-        gap_portion = result.total_drug_spending_after - INITIAL_COVERAGE_LIMIT
-        assert gap_portion > 0
-        assert result.coverage_gap_oop == pytest.approx(gap_portion * 0.25, rel=0.01)
-
-
-class TestCatastrophicPhase:
-    """Fill with total drug spending ≥ $8,000 enters catastrophic."""
-
-    def test_catastrophic_detected(self):
-        basis = _make_basis(unit_cost=20.0)
-        channel_summary = _make_channel_summary()
-        result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=1800.0, lis_status="none",
-            total_drug_spending_accumulated=9000.0,  # Past $8,000
-        )
-        assert result is not None
-        assert result.coverage_phase == "catastrophic"
-        assert result.catastrophic_oop > 0
-        assert result.coverage_gap_oop == 0.0
-        # Brand catastrophic: min(max($4.50, 5% * negotiated), $44, negotiated)
-        negotiated = result.negotiated_price
-        expected = min(max(4.50, negotiated * 0.05), 44.0, negotiated)
-        assert result.catastrophic_oop == pytest.approx(expected)
-
-    def test_straddling_gap_to_catastrophic(self):
-        """Fill that crosses $8,000 TrOOP mid-fill."""
-        basis = _make_basis(unit_cost=100.0)  # Large per-unit cost
-        channel_summary = _make_channel_summary()
-        # TDS at 7900, fill adds ~3002 → crosses 8000
-        result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=1900.0, lis_status="none",
-            total_drug_spending_accumulated=7900.0,
-        )
-        assert result is not None
-        assert result.coverage_phase == "coverage_gap_then_catastrophic"
-        assert result.coverage_gap_oop > 0
-        assert result.catastrophic_oop > 0
-
-    def test_catastrophic_generic_minimal_copay(self):
-        basis = _make_basis(unit_cost=5.0, tier_family="generic")
-        channel_summary = _make_channel_summary()
-        result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=1500.0, lis_status="none",
-            total_drug_spending_accumulated=10000.0,
-        )
-        assert result is not None
-        assert result.coverage_phase == "catastrophic"
-        # Generic catastrophic: min($4.50, negotiated)
-        assert result.catastrophic_oop == pytest.approx(min(4.50, result.negotiated_price))
-
-
-class TestOopCapInteraction:
-    """Verify OOP cap ($2,000) still applies across all phases."""
-
-    def test_oop_cap_in_gap_phase(self):
-        basis = _make_basis(unit_cost=20.0)
-        channel_summary = _make_channel_summary()
-        result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=1990.0,  # Near cap
+            basis,
+            channel_summary,
+            "pref_retail",
+            quantity=30.0,
+            remaining_deductible=0.0,
+            oop_accumulated=1990.0,
             lis_status="none",
-            total_drug_spending_accumulated=6000.0,  # In gap
+            total_drug_spending_accumulated=9000.0,
         )
         assert result is not None
-        assert result.total_oop <= ANNUAL_OOP_CAP - 1990.0 + 0.01
+        assert result.benefit_design == BENEFIT_DESIGN_2025
+        assert result.total_oop == pytest.approx(10.0)
+        assert result.oop_after == pytest.approx(ANNUAL_OOP_CAP)
+        assert result.oop_cap_applied is True
 
-    def test_oop_cap_already_reached(self):
+    def test_fills_are_free_after_cap_is_reached(self):
         basis = _make_basis(unit_cost=20.0)
         channel_summary = _make_channel_summary()
         result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=2000.0,  # Already at cap
+            basis,
+            channel_summary,
+            "pref_retail",
+            quantity=30.0,
+            remaining_deductible=0.0,
+            oop_accumulated=ANNUAL_OOP_CAP,
             lis_status="none",
-            total_drug_spending_accumulated=6000.0,
+            total_drug_spending_accumulated=12000.0,
         )
         assert result is not None
         assert result.total_oop == 0.0
         assert result.oop_cap_applied is True
+        assert result.coverage_gap_oop == 0.0
+        assert result.catastrophic_oop == 0.0
 
 
-class TestLISInCoverageGap:
-    """Verify LIS adjustments work in coverage gap."""
-
-    def test_full_lis_caps_in_gap(self):
-        basis = _make_basis(unit_cost=20.0, tier_family="brand")
+class Test2024StandardMode:
+    def test_catastrophic_depends_on_troop_not_total_drug_spend(self):
+        basis = _make_basis(unit_cost=20.0)
         channel_summary = _make_channel_summary()
         result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=100.0, lis_status="full",
-            total_drug_spending_accumulated=6000.0,
+            basis,
+            channel_summary,
+            "pref_retail",
+            quantity=30.0,
+            remaining_deductible=0.0,
+            oop_accumulated=100.0,
+            lis_status="none",
+            total_drug_spending_accumulated=9000.0,
+            benefit_design=BENEFIT_DESIGN_2024,
+            troop_accumulated=100.0,
         )
         assert result is not None
-        # Full LIS brand cap is $12.15
-        assert result.lis_adjusted_oop <= 12.15
-        assert result.total_oop <= 12.15
+        assert result.benefit_design == BENEFIT_DESIGN_2024
+        assert result.coverage_phase == "coverage_gap"
+        assert result.coverage_gap_oop > 0.0
+        assert result.catastrophic_oop == 0.0
+        assert result.troop_before == pytest.approx(100.0)
+        assert result.troop_after == pytest.approx(100.0 + result.coverage_gap_oop)
 
-
-class TestBackwardCompatibility:
-    """Verify existing initial-coverage fills still work identically."""
-
-    def test_initial_coverage_without_tds(self):
-        """Call without total_drug_spending_accumulated (default=0.0)."""
+    def test_initial_limit_straddle_uses_segmented_math_without_double_charging(self):
         basis = _make_basis(unit_cost=10.0)
         channel_summary = _make_channel_summary()
         result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=0.0,
-            oop_accumulated=0.0, lis_status="none",
+            basis,
+            channel_summary,
+            "pref_retail",
+            quantity=30.0,
+            remaining_deductible=0.0,
+            oop_accumulated=400.0,
+            lis_status="none",
+            total_drug_spending_accumulated=5000.0,
+            benefit_design=BENEFIT_DESIGN_2024,
+            troop_accumulated=400.0,
         )
         assert result is not None
-        assert result.coverage_phase == "initial_coverage_rule"
-        assert result.total_drug_spending_before == 0.0
-        assert result.total_drug_spending_after > 0.0
+        assert result.coverage_phase == "initial_coverage_rule_then_coverage_gap"
+        assert result.negotiated_price == pytest.approx(302.0)
+        assert result.coverage_gap_oop == pytest.approx((result.negotiated_price - 30.0) * 0.25)
+        expected_initial_cost = 25.0 * (30.0 / result.negotiated_price)
+        expected_total = expected_initial_cost + result.coverage_gap_oop
+        assert result.total_oop == pytest.approx(expected_total, rel=1e-4)
+        assert result.total_oop < 93.0
+        assert result.total_drug_spending_before == pytest.approx(5000.0)
+        assert result.total_drug_spending_after == pytest.approx(5000.0 + result.negotiated_price)
 
-    def test_deductible_phase_still_works(self):
-        basis = _make_basis(unit_cost=10.0, deductible_applies=True)
+    def test_gap_to_catastrophic_straddle_caps_gap_at_remaining_troop(self):
+        basis = _make_basis(unit_cost=500.0)
         channel_summary = _make_channel_summary()
         result = _simulate_fill_cost(
-            basis, channel_summary, "pref_retail",
-            quantity=30.0, remaining_deductible=100.0,
-            oop_accumulated=0.0, lis_status="none",
-            total_drug_spending_accumulated=0.0,
+            basis,
+            channel_summary,
+            "pref_retail",
+            quantity=30.0,
+            remaining_deductible=0.0,
+            oop_accumulated=1950.0,
+            lis_status="none",
+            total_drug_spending_accumulated=INITIAL_COVERAGE_LIMIT + 100.0,
+            benefit_design=BENEFIT_DESIGN_2024,
+            troop_accumulated=CATASTROPHIC_TROOP_THRESHOLD - 50.0,
         )
         assert result is not None
-        assert "deductible" in result.coverage_phase
-        assert result.deductible_exposure > 0
+        assert result.coverage_phase == "coverage_gap_then_catastrophic"
+        assert result.coverage_gap_oop == pytest.approx(50.0)
+        assert result.catastrophic_oop == 0.0
+        assert result.total_oop == pytest.approx(50.0)
+        assert result.troop_after == pytest.approx(CATASTROPHIC_TROOP_THRESHOLD)
+
+    def test_lis_adjustment_still_applies_inside_2024_gap_logic(self):
+        basis = _make_basis(unit_cost=20.0, tier_family="brand")
+        channel_summary = _make_channel_summary()
+        result = _simulate_fill_cost(
+            basis,
+            channel_summary,
+            "pref_retail",
+            quantity=30.0,
+            remaining_deductible=0.0,
+            oop_accumulated=100.0,
+            lis_status="full",
+            total_drug_spending_accumulated=6000.0,
+            benefit_design=BENEFIT_DESIGN_2024,
+            troop_accumulated=100.0,
+        )
+        assert result is not None
+        assert result.coverage_phase == "coverage_gap"
+        assert result.coverage_gap_oop > 12.15
+        assert result.lis_adjusted_oop <= 12.15
+        assert result.total_oop <= 12.15

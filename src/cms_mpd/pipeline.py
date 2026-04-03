@@ -521,6 +521,7 @@ def _build_silver(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> No
                 p.formulary_id,
                 trim(bf.RXCUI) AS rxcui,
                 lpad(trim(bf.NDC), 11, '0') AS ndc,
+                try_cast(trim(bf.CONTRACT_YEAR) AS INTEGER) AS contract_year,
                 try_cast(trim(bf.TIER_LEVEL_VALUE) AS INTEGER) AS tier_level_value,
                 CASE
                     WHEN try_cast(trim(bf.TIER_LEVEL_VALUE) AS DOUBLE) <= 2 THEN 'generic'
@@ -564,6 +565,7 @@ def _build_silver(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> No
             f.plan_key,
             f.rxcui,
             f.ndc,
+            f.contract_year,
             f.tier_level_value,
             f.tier_family,
             pr.days_supply,
@@ -900,6 +902,7 @@ def _build_gold(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> None
             c.plan_key,
             c.rxcui,
             c.ndc,
+            c.contract_year,
             coalesce(d_ndc.preferred_name, d_rx.preferred_name) AS drug_name,
             c.days_supply,
             c.tier_level_value,
@@ -984,6 +987,11 @@ def _build_gold(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> None
             SELECT plan_key, count(DISTINCT county_code) AS served_counties
             FROM silver.bridge_plan_service_area
             GROUP BY 1
+        ),
+        contract_years AS (
+            SELECT plan_key, max(contract_year) AS contract_year
+            FROM gold.plan_drug_cost_basis
+            GROUP BY 1
         )
         SELECT
             p.plan_key,
@@ -994,6 +1002,7 @@ def _build_gold(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> None
             p.contract_name,
             p.plan_type,
             p.service_area_type,
+            cy.contract_year,
             p.state_abbr,
             p.ma_region_code,
             p.pdp_region_code,
@@ -1018,6 +1027,7 @@ def _build_gold(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> None
           ON p.plan_key = scope.plan_key
         LEFT JOIN gold.plan_formulary_summary f ON p.plan_key = f.plan_key
         LEFT JOIN service_counts s ON p.plan_key = s.plan_key
+        LEFT JOIN contract_years cy ON p.plan_key = cy.plan_key
         WHERE p.is_suppressed = FALSE
         """,
         checkpoint=True,
@@ -1039,6 +1049,7 @@ def _build_gold(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> None
             p.plan_name,
             p.plan_type,
             p.service_area_type,
+            p.contract_year,
             p.annual_premium,
             p.deductible,
             p.served_counties,
@@ -1073,6 +1084,7 @@ def _build_gold(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> None
         SELECT
             basis.plan_key,
             summary.plan_name,
+            summary.contract_year,
             summary.annual_premium,
             summary.deductible,
             network.network_flag,
@@ -1105,6 +1117,7 @@ def _build_gold(conn: duckdb.DuckDBPyConnection, config: PipelineConfig) -> None
             summary.plan_name,
             summary.plan_type,
             summary.service_area_type,
+            summary.contract_year,
             summary.annual_premium,
             summary.deductible,
             summary.covered_drug_count,
@@ -1133,6 +1146,7 @@ def _write_manifest(config: PipelineConfig, sources: SourcePaths) -> None:
     payload = {
         "snapshot_quarter": config.snapshot_quarter,
         "build_profile": config.build_profile,
+        "benefit_design_mode": config.benefit_design_mode,
         "demo_zipcodes": list(config.normalized_demo_zipcodes),
         "cms_files": {key: str(value) for key, value in sources.cms_files.items()},
         "pharmacy_network_parts": [str(value) for value in sources.pharmacy_network_parts],

@@ -24,15 +24,14 @@ INITIAL_COVERAGE_LIMIT = 5030.00
 CATASTROPHIC_TROOP_THRESHOLD = 8000.00
 COVERAGE_GAP_GENERIC_COINSURANCE = 0.25
 COVERAGE_GAP_BRAND_COINSURANCE = 0.25
-CATASTROPHIC_GENERIC_COPAY = 4.50
-CATASTROPHIC_BRAND_COINSURANCE = 0.05
-CATASTROPHIC_BRAND_MAX_COPAY = 44.00
+BENEFIT_DESIGN_2025 = "2025_redesign"
+BENEFIT_DESIGN_2024 = "2024_standard"
 NETWORK_PRIORITY = {
     "adequate": 0,
     "limited_preferred_retail": 1,
     "no_preferred_retail": 2,
 }
-FEATURE_VERSION = "research_v2"
+FEATURE_VERSION = "research_v3"
 FOCUS_WEIGHTS = {
     "balanced": {
         "cost": 0.28,
@@ -210,6 +209,9 @@ class DrugFillTrace:
     total_drug_spending_before: float = 0.0
     total_drug_spending_after: float = 0.0
     coverage_gap_exposure: float = 0.0
+    troop_before: float = 0.0
+    troop_after: float = 0.0
+    benefit_design: str = BENEFIT_DESIGN_2025
 
 
 @dataclass(slots=True)
@@ -231,6 +233,9 @@ class FillCostResult:
     oop_cap_applied: bool
     total_drug_spending_before: float = 0.0
     total_drug_spending_after: float = 0.0
+    troop_before: float = 0.0
+    troop_after: float = 0.0
+    benefit_design: str = BENEFIT_DESIGN_2025
 
 
 @dataclass(slots=True)
@@ -313,6 +318,8 @@ class PlanRecommendation:
     comparison_only: bool
     feature_version: str
     drug_breakdowns: list[PlanDrugBreakdown]
+    contract_year: int | None = None
+    benefit_design: str = BENEFIT_DESIGN_2025
 
 
 def _normalize_days_supply(day_supply: int) -> int:
@@ -327,6 +334,38 @@ def _normalize_days_supply(day_supply: int) -> int:
 
 def _normalize_zipcode(zipcode: str) -> str:
     return zipcode.strip().zfill(5)
+
+
+def _coerce_contract_year(value: Any) -> int | None:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_contract_year(config: PipelineConfig | None) -> int | None:
+    active_config = config or PipelineConfig()
+    try:
+        return int(str(active_config.snapshot_quarter).split('-', 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_plan_benefit_design(
+    contract_year: int | None, config: PipelineConfig | None
+) -> tuple[int | None, str]:
+    active_config = config or PipelineConfig()
+    mode = active_config.benefit_design_mode
+    effective_year = contract_year or _snapshot_contract_year(active_config)
+    if mode == BENEFIT_DESIGN_2024:
+        return effective_year or 2024, BENEFIT_DESIGN_2024
+    if mode == BENEFIT_DESIGN_2025:
+        return effective_year or 2025, BENEFIT_DESIGN_2025
+    if effective_year is not None and effective_year <= 2024:
+        return effective_year, BENEFIT_DESIGN_2024
+    return effective_year or 2025, BENEFIT_DESIGN_2025
 
 
 def _connect(config: PipelineConfig | None) -> duckdb.DuckDBPyConnection:
@@ -899,11 +938,7 @@ def _lookup_nearest_preferred_distance(
 def _compute_coverage_gap_cost(
     negotiated: float, tier_family: str
 ) -> float:
-    """Compute beneficiary cost-sharing in the coverage gap (donut hole).
-
-    In the coverage gap, beneficiaries pay 25% coinsurance on both generic
-    and brand drugs (CMS 2025 rules).
-    """
+    """Compute beneficiary cost-sharing in the 2024 coverage gap."""
     coinsurance = (
         COVERAGE_GAP_GENERIC_COINSURANCE
         if tier_family == "generic"
@@ -915,20 +950,86 @@ def _compute_coverage_gap_cost(
 def _compute_catastrophic_cost(
     negotiated: float, tier_family: str
 ) -> float:
-    """Compute beneficiary cost-sharing in the catastrophic phase.
-
-    In the catastrophic phase, beneficiaries pay the greater of:
-    - A small copay ($4.50 generic / $11.20 brand), or
-    - 5% coinsurance
-    But for brand drugs, CMS caps the copay at $44.00.
-    """
-    if tier_family == "generic":
-        return min(CATASTROPHIC_GENERIC_COPAY, negotiated)
-    brand_coinsurance = negotiated * CATASTROPHIC_BRAND_COINSURANCE
-    return min(max(CATASTROPHIC_GENERIC_COPAY, brand_coinsurance), CATASTROPHIC_BRAND_MAX_COPAY, negotiated)
+    """Catastrophic beneficiary liability is modeled as $0 in 2024 mode."""
+    return 0.0
 
 
-def _simulate_fill_cost(
+def _scale_segment_cost(total_cost: float | None, segment_negotiated: float, negotiated_total: float) -> float | None:
+    if total_cost is None:
+        return None
+    if segment_negotiated <= 0 or negotiated_total <= 0:
+        return 0.0
+    scaled = float(total_cost) * (segment_negotiated / negotiated_total)
+    return min(segment_negotiated, max(0.0, scaled))
+
+
+def _initial_phase_component(
+    basis: dict[str, Any],
+    negotiated_total: float,
+    segment_negotiated: float,
+    remaining_deductible: float,
+    channel_prefix: str,
+    insulin_prefix: str,
+) -> tuple[float | None, float, float, float, str]:
+    if segment_negotiated <= 0:
+        return 0.0, 0.0, 0.0, remaining_deductible, "initial_coverage_rule"
+
+    deductible_before = max(0.0, remaining_deductible)
+    if bool(basis["is_insulin"]):
+        insulin_value = basis.get(f"insulin_{insulin_prefix}_copay")
+        if insulin_value is not None and not pd.isna(insulin_value):
+            total_cost = min(float(insulin_value), negotiated_total)
+            coverage_phase = "insulin_override"
+        else:
+            total_cost = _apply_cost_rule(
+                negotiated_total,
+                basis.get(f"init_{channel_prefix}_cost_type"),
+                basis.get(f"init_{channel_prefix}_cost_amt"),
+                basis.get(f"init_{channel_prefix}_cost_min"),
+                basis.get(f"init_{channel_prefix}_cost_max"),
+            )
+            coverage_phase = "insulin_initial_coverage_rule"
+        segment_cost = _scale_segment_cost(total_cost, segment_negotiated, negotiated_total)
+        return segment_cost, 0.0, segment_cost or 0.0, deductible_before, coverage_phase
+
+    init_cost = _apply_cost_rule(
+        negotiated_total,
+        basis.get(f"init_{channel_prefix}_cost_type"),
+        basis.get(f"init_{channel_prefix}_cost_amt"),
+        basis.get(f"init_{channel_prefix}_cost_min"),
+        basis.get(f"init_{channel_prefix}_cost_max"),
+    )
+    pre_cost = _apply_cost_rule(
+        negotiated_total,
+        basis.get(f"pre_{channel_prefix}_cost_type"),
+        basis.get(f"pre_{channel_prefix}_cost_amt"),
+        basis.get(f"pre_{channel_prefix}_cost_min"),
+        basis.get(f"pre_{channel_prefix}_cost_max"),
+    )
+
+    if deductible_before > 0 and bool(basis["deductible_applies"]):
+        deductible_exposure = min(segment_negotiated, deductible_before)
+        deductible_after = max(0.0, deductible_before - deductible_exposure)
+        covered_remainder = max(segment_negotiated - deductible_exposure, 0.0)
+        remainder_oop = 0.0
+        if covered_remainder > 0 and init_cost is not None:
+            scaled_init_cost = _scale_segment_cost(init_cost, covered_remainder, negotiated_total)
+            remainder_oop = min(covered_remainder, scaled_init_cost or 0.0)
+        base_cost = deductible_exposure + remainder_oop
+        coverage_phase = (
+            "deductible_then_initial_coverage" if covered_remainder > 0 else "deductible_only"
+        )
+        return base_cost, deductible_exposure, remainder_oop, deductible_after, coverage_phase
+
+    rule_cost = pre_cost if deductible_before > 0 and pre_cost is not None else init_cost
+    if rule_cost is None:
+        return None, 0.0, 0.0, deductible_before, ""
+    segment_cost = _scale_segment_cost(rule_cost, segment_negotiated, negotiated_total)
+    coverage_phase = "predeductible_rule" if deductible_before > 0 and pre_cost is not None else "initial_coverage_rule"
+    return segment_cost, 0.0, segment_cost or 0.0, deductible_before, coverage_phase
+
+
+def _simulate_fill_cost_2025(
     basis: dict[str, Any],
     channel_summary: dict[str, Any],
     channel: str,
@@ -947,114 +1048,20 @@ def _simulate_fill_cost(
     deductible_before = max(0.0, remaining_deductible)
     oop_before = max(0.0, oop_accumulated)
     tds_before = max(0.0, total_drug_spending_accumulated)
-    tds_after = tds_before + negotiated
     tier_family = str(basis["tier_family"])
 
-    coverage_gap_oop = 0.0
-    catastrophic_oop_amount = 0.0
-
-    # ── Catastrophic phase: TrOOP already exceeded threshold ──
-    if tds_before >= CATASTROPHIC_TROOP_THRESHOLD:
-        base_cost = _compute_catastrophic_cost(negotiated, tier_family)
-        deductible_exposure = 0.0
-        deductible_after = deductible_before
-        initial_coverage_oop = 0.0
-        coverage_gap_oop = 0.0
-        catastrophic_oop_amount = base_cost
-        coverage_phase = "catastrophic"
-
-    # ── Coverage gap (donut hole): total drug spending past initial coverage limit ──
-    elif tds_before >= INITIAL_COVERAGE_LIMIT:
-        if tds_after >= CATASTROPHIC_TROOP_THRESHOLD:
-            gap_portion = max(0.0, CATASTROPHIC_TROOP_THRESHOLD - tds_before)
-            catastrophic_portion = max(0.0, tds_after - CATASTROPHIC_TROOP_THRESHOLD)
-            gap_cost = _compute_coverage_gap_cost(gap_portion, tier_family)
-            cat_cost = _compute_catastrophic_cost(catastrophic_portion, tier_family)
-            base_cost = gap_cost + cat_cost
-            coverage_gap_oop = gap_cost
-            catastrophic_oop_amount = cat_cost
-            coverage_phase = "coverage_gap_then_catastrophic"
-        else:
-            base_cost = _compute_coverage_gap_cost(negotiated, tier_family)
-            coverage_gap_oop = base_cost
-            coverage_phase = "coverage_gap"
-        deductible_exposure = 0.0
-        deductible_after = deductible_before
-        initial_coverage_oop = 0.0
-
-    # ── Initial coverage / deductible phases ──
-    else:
-        if bool(basis["is_insulin"]):
-            insulin_value = basis.get(f"insulin_{insulin_prefix}_copay")
-            if insulin_value is not None and not pd.isna(insulin_value):
-                base_cost = min(float(insulin_value), negotiated)
-                coverage_phase = "insulin_override"
-            else:
-                base_cost = _apply_cost_rule(
-                    negotiated,
-                    basis.get(f"init_{channel_prefix}_cost_type"),
-                    basis.get(f"init_{channel_prefix}_cost_amt"),
-                    basis.get(f"init_{channel_prefix}_cost_min"),
-                    basis.get(f"init_{channel_prefix}_cost_max"),
-                )
-                coverage_phase = "insulin_initial_coverage_rule"
-            deductible_exposure = 0.0
-            initial_coverage_oop = base_cost or 0.0
-            deductible_after = deductible_before
-        else:
-            init_cost = _apply_cost_rule(
-                negotiated,
-                basis.get(f"init_{channel_prefix}_cost_type"),
-                basis.get(f"init_{channel_prefix}_cost_amt"),
-                basis.get(f"init_{channel_prefix}_cost_min"),
-                basis.get(f"init_{channel_prefix}_cost_max"),
-            )
-            pre_cost = _apply_cost_rule(
-                negotiated,
-                basis.get(f"pre_{channel_prefix}_cost_type"),
-                basis.get(f"pre_{channel_prefix}_cost_amt"),
-                basis.get(f"pre_{channel_prefix}_cost_min"),
-                basis.get(f"pre_{channel_prefix}_cost_max"),
-            )
-
-            if deductible_before > 0 and bool(basis["deductible_applies"]):
-                deductible_exposure = min(negotiated, deductible_before)
-                deductible_after = max(0.0, deductible_before - deductible_exposure)
-                covered_remainder = max(negotiated - deductible_exposure, 0.0)
-                remainder_oop = 0.0
-                if covered_remainder > 0 and init_cost is not None:
-                    init_ratio = 0.0 if negotiated == 0 else covered_remainder / negotiated
-                    remainder_oop = min(covered_remainder, init_cost * init_ratio)
-                base_cost = deductible_exposure + remainder_oop
-                initial_coverage_oop = remainder_oop
-                coverage_phase = (
-                    "deductible_then_initial_coverage" if covered_remainder > 0 else "deductible_only"
-                )
-            else:
-                rule_cost = pre_cost if deductible_before > 0 and pre_cost is not None else init_cost
-                if rule_cost is None:
-                    return None
-                base_cost = rule_cost
-                deductible_exposure = 0.0
-                deductible_after = deductible_before
-                initial_coverage_oop = rule_cost
-                coverage_phase = "predeductible_rule" if deductible_before > 0 and pre_cost is not None else "initial_coverage_rule"
-
-        # ── Handle straddling into coverage gap within this fill ──
-        if tds_after > INITIAL_COVERAGE_LIMIT and tds_before < INITIAL_COVERAGE_LIMIT:
-            gap_portion_negotiated = tds_after - INITIAL_COVERAGE_LIMIT
-            gap_cost = _compute_coverage_gap_cost(gap_portion_negotiated, tier_family)
-            coverage_gap_oop = gap_cost
-            coverage_phase = coverage_phase + "_then_coverage_gap"
-
+    base_cost, deductible_exposure, initial_coverage_oop, deductible_after, coverage_phase = _initial_phase_component(
+        basis,
+        negotiated,
+        negotiated,
+        deductible_before,
+        channel_prefix,
+        insulin_prefix,
+    )
     if base_cost is None:
         return None
 
-    # Add coverage gap cost for straddle fills
-    total_base_cost = base_cost + coverage_gap_oop if coverage_phase.endswith("_then_coverage_gap") else base_cost
-
-    lis_adjusted_cost = _apply_lis_adjustment(total_base_cost, tier_family, lis_status)
-    oop_cap_applied = False
+    lis_adjusted_cost = _apply_lis_adjustment(base_cost, tier_family, lis_status)
     if oop_before >= ANNUAL_OOP_CAP:
         final_cost = 0.0
         oop_cap_applied = True
@@ -1065,12 +1072,12 @@ def _simulate_fill_cost(
 
     return FillCostResult(
         total_oop=final_cost,
-        base_oop=max(0.0, total_base_cost),
+        base_oop=max(0.0, base_cost),
         lis_adjusted_oop=max(0.0, lis_adjusted_cost),
         deductible_exposure=max(0.0, deductible_exposure),
         initial_coverage_oop=max(0.0, initial_coverage_oop),
-        coverage_gap_oop=max(0.0, coverage_gap_oop),
-        catastrophic_oop=max(0.0, catastrophic_oop_amount),
+        coverage_gap_oop=0.0,
+        catastrophic_oop=0.0,
         negotiated_price=negotiated,
         coverage_phase=coverage_phase,
         pricing_status="priced",
@@ -1080,7 +1087,173 @@ def _simulate_fill_cost(
         oop_after=oop_before + final_cost,
         oop_cap_applied=oop_cap_applied,
         total_drug_spending_before=tds_before,
+        total_drug_spending_after=tds_before + negotiated,
+        troop_before=oop_before,
+        troop_after=oop_before + final_cost,
+        benefit_design=BENEFIT_DESIGN_2025,
+    )
+
+
+def _simulate_fill_cost_2024(
+    basis: dict[str, Any],
+    channel_summary: dict[str, Any],
+    channel: str,
+    quantity: float,
+    remaining_deductible: float,
+    oop_accumulated: float,
+    lis_status: str,
+    total_drug_spending_accumulated: float = 0.0,
+    troop_accumulated: float = 0.0,
+) -> FillCostResult | None:
+    fee = _select_fee(channel_summary, channel, str(basis["tier_family"]), int(basis["days_supply"]))
+    if fee is None or basis["unit_cost"] is None or pd.isna(basis["unit_cost"]):
+        return None
+
+    negotiated = max(float(basis["unit_cost"]) * quantity + fee, _select_floor(channel_summary, channel))
+    channel_prefix, insulin_prefix = _channel_fields(channel)
+    deductible_before = max(0.0, remaining_deductible)
+    oop_before = max(0.0, oop_accumulated)
+    troop_before = max(0.0, troop_accumulated)
+    tds_before = max(0.0, total_drug_spending_accumulated)
+    tds_after = tds_before + negotiated
+    tier_family = str(basis["tier_family"])
+
+    if troop_before >= CATASTROPHIC_TROOP_THRESHOLD:
+        return FillCostResult(
+            total_oop=0.0,
+            base_oop=0.0,
+            lis_adjusted_oop=0.0,
+            deductible_exposure=0.0,
+            initial_coverage_oop=0.0,
+            coverage_gap_oop=0.0,
+            catastrophic_oop=0.0,
+            negotiated_price=negotiated,
+            coverage_phase="catastrophic",
+            pricing_status="priced",
+            deductible_before=deductible_before,
+            deductible_after=deductible_before,
+            oop_before=oop_before,
+            oop_after=oop_before,
+            oop_cap_applied=False,
+            total_drug_spending_before=tds_before,
+            total_drug_spending_after=tds_after,
+            troop_before=troop_before,
+            troop_after=troop_before,
+            benefit_design=BENEFIT_DESIGN_2024,
+        )
+
+    initial_segment_negotiated = 0.0
+    if tds_before < INITIAL_COVERAGE_LIMIT:
+        initial_segment_negotiated = min(negotiated, max(0.0, INITIAL_COVERAGE_LIMIT - tds_before))
+    remaining_negotiated = max(0.0, negotiated - initial_segment_negotiated)
+
+    base_cost = 0.0
+    deductible_exposure = 0.0
+    initial_coverage_oop = 0.0
+    deductible_after = deductible_before
+    initial_phase = ""
+    if initial_segment_negotiated > 0:
+        initial_cost, deductible_exposure, initial_coverage_oop, deductible_after, initial_phase = _initial_phase_component(
+            basis,
+            negotiated,
+            initial_segment_negotiated,
+            deductible_before,
+            channel_prefix,
+            insulin_prefix,
+        )
+        if initial_cost is None:
+            return None
+        base_cost += initial_cost
+
+    gap_full_cost = 0.0
+    coverage_gap_oop = 0.0
+    catastrophic_oop = 0.0
+    entered_catastrophic = False
+    if remaining_negotiated > 0:
+        gap_full_cost = _compute_coverage_gap_cost(remaining_negotiated, tier_family)
+        remaining_troop = max(0.0, CATASTROPHIC_TROOP_THRESHOLD - (troop_before + base_cost))
+        coverage_gap_oop = min(gap_full_cost, remaining_troop)
+        entered_catastrophic = gap_full_cost > coverage_gap_oop
+        catastrophic_oop = _compute_catastrophic_cost(max(0.0, remaining_negotiated), tier_family) if entered_catastrophic else 0.0
+        base_cost += coverage_gap_oop + catastrophic_oop
+
+    lis_adjusted_cost = _apply_lis_adjustment(base_cost, tier_family, lis_status)
+    if initial_phase:
+        if remaining_negotiated <= 0:
+            coverage_phase = initial_phase
+        elif coverage_gap_oop > 0 and entered_catastrophic:
+            coverage_phase = f"{initial_phase}_then_coverage_gap_then_catastrophic"
+        elif coverage_gap_oop > 0:
+            coverage_phase = f"{initial_phase}_then_coverage_gap"
+        else:
+            coverage_phase = f"{initial_phase}_then_catastrophic"
+    else:
+        if coverage_gap_oop > 0 and entered_catastrophic:
+            coverage_phase = "coverage_gap_then_catastrophic"
+        elif coverage_gap_oop > 0:
+            coverage_phase = "coverage_gap"
+        else:
+            coverage_phase = "catastrophic"
+
+    return FillCostResult(
+        total_oop=max(0.0, lis_adjusted_cost),
+        base_oop=max(0.0, base_cost),
+        lis_adjusted_oop=max(0.0, lis_adjusted_cost),
+        deductible_exposure=max(0.0, deductible_exposure),
+        initial_coverage_oop=max(0.0, initial_coverage_oop),
+        coverage_gap_oop=max(0.0, coverage_gap_oop),
+        catastrophic_oop=max(0.0, catastrophic_oop),
+        negotiated_price=negotiated,
+        coverage_phase=coverage_phase,
+        pricing_status="priced",
+        deductible_before=deductible_before,
+        deductible_after=deductible_after,
+        oop_before=oop_before,
+        oop_after=oop_before + max(0.0, lis_adjusted_cost),
+        oop_cap_applied=False,
+        total_drug_spending_before=tds_before,
         total_drug_spending_after=tds_after,
+        troop_before=troop_before,
+        troop_after=troop_before + max(0.0, base_cost),
+        benefit_design=BENEFIT_DESIGN_2024,
+    )
+
+
+def _simulate_fill_cost(
+    basis: dict[str, Any],
+    channel_summary: dict[str, Any],
+    channel: str,
+    quantity: float,
+    remaining_deductible: float,
+    oop_accumulated: float,
+    lis_status: str,
+    total_drug_spending_accumulated: float = 0.0,
+    *,
+    benefit_design: str = BENEFIT_DESIGN_2025,
+    troop_accumulated: float | None = None,
+) -> FillCostResult | None:
+    active_troop = max(0.0, troop_accumulated if troop_accumulated is not None else oop_accumulated)
+    if benefit_design == BENEFIT_DESIGN_2024:
+        return _simulate_fill_cost_2024(
+            basis,
+            channel_summary,
+            channel,
+            quantity,
+            remaining_deductible,
+            oop_accumulated,
+            lis_status,
+            total_drug_spending_accumulated=total_drug_spending_accumulated,
+            troop_accumulated=active_troop,
+        )
+    return _simulate_fill_cost_2025(
+        basis,
+        channel_summary,
+        channel,
+        quantity,
+        remaining_deductible,
+        oop_accumulated,
+        lis_status,
+        total_drug_spending_accumulated=total_drug_spending_accumulated,
     )
 
 
@@ -1231,13 +1404,14 @@ def recommend_plans(
     if not medications:
         raise ValueError("At least one medication is required.")
 
+    active_config = config or PipelineConfig()
     logger.info(
         "recommendation request zipcode=%s medications=%s profile=%s",
         beneficiary.zipcode,
         len(medications),
-        (config or PipelineConfig()).build_profile,
+        active_config.build_profile,
     )
-    conn = _connect(config)
+    conn = _connect(active_config)
     zipcode = _normalize_zipcode(beneficiary.zipcode)
     candidate_plans = _fetch_dataframe(
         conn,
@@ -1245,6 +1419,7 @@ def recommend_plans(
         SELECT DISTINCT
             psa.plan_key,
             ps.plan_name,
+            ps.contract_year,
             ps.annual_premium,
             ps.deductible,
             pns.network_flag
@@ -1336,9 +1511,14 @@ def recommend_plans(
 
     for plan in candidate_plans.to_dict("records"):
         plan_key = str(plan["plan_key"])
+        contract_year, benefit_design = _resolve_plan_benefit_design(
+            _coerce_contract_year(plan.get("contract_year")),
+            active_config,
+        )
         channel_summary = channel_lookup.get(plan_key, {})
         remaining_deductible = float(plan.get("deductible") or 0.0)
         oop_accumulated = 0.0
+        troop_accumulated = 0.0
         total_drug_spending = 0.0
         annual_drug_oop = 0.0
         plan_restriction_flags = {"prior_auth": False, "step_therapy": False, "quantity_limit": False}
@@ -1435,6 +1615,8 @@ def recommend_plans(
                     oop_accumulated,
                     beneficiary.lis_status,
                     total_drug_spending_accumulated=total_drug_spending,
+                    benefit_design=benefit_design,
+                    troop_accumulated=troop_accumulated,
                 )
                 if channel_result is None:
                     continue
@@ -1459,6 +1641,7 @@ def recommend_plans(
 
             remaining_deductible = best_result.deductible_after
             oop_accumulated = best_result.oop_after
+            troop_accumulated = best_result.troop_after
             total_drug_spending = best_result.total_drug_spending_after
             annual_drug_oop += best_result.total_oop
             state["selected_channel"] = best_channel
@@ -1493,6 +1676,9 @@ def recommend_plans(
                     total_drug_spending_before=round(best_result.total_drug_spending_before, 2),
                     total_drug_spending_after=round(best_result.total_drug_spending_after, 2),
                     coverage_gap_exposure=round(best_result.coverage_gap_oop, 2),
+                    troop_before=round(best_result.troop_before, 2),
+                    troop_after=round(best_result.troop_after, 2),
+                    benefit_design=best_result.benefit_design,
                 )
             )
             selected_channels[best_channel] = selected_channels.get(best_channel, 0) + 1
@@ -1657,7 +1843,7 @@ def recommend_plans(
                     st_flag=bool(basis["has_step_therapy"]) if basis else False,
                     ql_flag=bool(basis["has_quantity_limit"]) if basis else False,
                     insulin_flag=bool(basis["is_insulin"]) if basis else bool(medication["is_insulin"]),
-                    coverage_gap_flag=coverage_state != "covered",
+                    coverage_gap_flag=any("coverage_gap" in str(value) for value in state["coverage_phases"]),
                     coverage_status=coverage_state,
                     pricing_status=str(state["pricing_status"]),
                     coverage_phases=sorted(str(value) for value in state["coverage_phases"]),
@@ -1768,6 +1954,8 @@ def recommend_plans(
                 comparison_only=False,
                 feature_version=FEATURE_VERSION,
                 drug_breakdowns=breakdowns,
+                contract_year=contract_year,
+                benefit_design=benefit_design,
             )
         )
 
@@ -1789,7 +1977,7 @@ def recommend_plans(
     if ranking_mode == "hybrid":
         from .modeling import apply_hybrid_reranking
 
-        recommendations = apply_hybrid_reranking(recommendations, beneficiary, config=config)
+        recommendations = apply_hybrid_reranking(recommendations, beneficiary, config=active_config)
 
     conn.close()
     return recommendations[: max(1, beneficiary.top_n)]
@@ -1821,6 +2009,8 @@ def recommendations_to_frame(recommendations: list[PlanRecommendation]) -> pd.Da
                 "access_score": recommendation.fit_metrics.access_score,
                 "stability_score": recommendation.fit_metrics.stability_score,
                 "feature_version": recommendation.feature_version,
+                "contract_year": recommendation.contract_year,
+                "benefit_design": recommendation.benefit_design,
                 "best_channel_mix": recommendation.best_channel_mix,
                 "network_flag": recommendation.network_flag,
                 "network_access_summary": recommendation.network_access_summary,
@@ -1867,6 +2057,8 @@ def recommendations_to_comparison_frame(recommendations: list[PlanRecommendation
                 "coverage_score": recommendation.fit_metrics.coverage_score,
                 "access_score": recommendation.fit_metrics.access_score,
                 "stability_score": recommendation.fit_metrics.stability_score,
+                "contract_year": recommendation.contract_year,
+                "benefit_design": recommendation.benefit_design,
                 "restriction_summary": recommendation.restriction_summary,
                 "channel_mix": recommendation.best_channel_mix,
                 "service_area_eligible": recommendation.service_area_eligible,

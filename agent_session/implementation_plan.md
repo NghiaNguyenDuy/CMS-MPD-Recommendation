@@ -1,21 +1,22 @@
-# Enhancement Plan: Core Logic & Recommendation Workflow
+# Implementation Plan: Correctness-First Benefit Design Refresh
 
-## Revised Phase Order (per user feedback)
+## Supersession Note
+The earlier Phase 1 plan that treated coverage gap and catastrophic logic as the default for 2025 data is no longer current. This project now treats the 2025 Part D redesign as the primary path and keeps pre-2025 gap logic as explicit historical support.
 
-| Phase | Enhancement | Files Modified |
-|-------|-------------|---------------|
-| **1** | Coverage Gap (Donut Hole) + Catastrophic Phase | `recommend.py` |
-| **2** | Multi-Drug Deductible Sequencing Optimization | `recommend.py` |
-| **3** | Advanced Drug Resolution (Fuzzy by drug name) | `recommend.py`, `app_support.py` |
-| **4** | Temporal Cost Distribution (Monthly Curve) | `recommend.py`, `streamlit_app.py` |
-| **5** | Enhanced ML Reranking & Explainability | `modeling.py`, `recommend.py` |
-| **6** | Recommendation Workflow UX (What-If, Sensitivity) | NEW `scenario_analysis.py`, `streamlit_app.py` |
-| **7** | Pipeline: Generic Alternatives (drug-name search) | `pipeline.py`, `recommend.py` |
-| **8** | Plan Stability & YoY Signals (prior data) | `pipeline.py`, `recommend.py` |
+## Completed Plan
+| Step | Outcome | Main Files |
+|------|---------|------------|
+| 1 | Added `benefit_design_mode` config and CLI wiring (`auto`, `2025_redesign`, `2024_standard`) | `config.py`, `__main__.py` |
+| 2 | Propagated `contract_year` into gold serving assets and manifest output | `pipeline.py` |
+| 3 | Refactored recommendation simulation into explicit 2025 and 2024 benefit-design paths | `recommend.py` |
+| 4 | Fixed segmented threshold math and corrected coverage-gap reporting semantics | `recommend.py`, `tests/test_phase1_coverage_gap.py` |
+| 5 | Added `contract_year` and `benefit_design` to exports and audit contracts | `recommend.py`, `decision_support.py`, `tests/test_contracts.py` |
+| 6 | Hardened reranker evaluation with scenario-level held-out testing | `modeling.py`, `tests/test_pipeline_smoke.py` |
+| 7 | Updated project notes and docs to reflect the corrected default behavior | `README.md`, `docs/*`, `agent_session/*` |
 
-> [!IMPORTANT]
-> Each phase is independently testable. Phase 5 (Stability) moved to last per user request since prior data is available but lower priority.
-
-## Phase 1: Coverage Gap + Catastrophic Phase — READY TO IMPLEMENT
-
-See [task.md](file:///C:/Users/Admin/.gemini/antigravity/brain/22908bfa-9516-433d-a6f5-1aab7ac56f9a/task.md) for execution tracking.
+## Current Default Rules
+- `benefit_design_mode=auto` uses each plan's `contract_year` when available.
+- `contract_year >= 2025` resolves to `2025_redesign`.
+- `contract_year <= 2024` resolves to `2024_standard`.
+- `2025_redesign` removes coverage-gap and catastrophic phases from the default simulation path.
+- `2024_standard` keeps historical gap logic with separate total-spend and TrOOP accumulators.

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
@@ -180,6 +180,8 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
 
     conn = duckdb.connect(str(db_path), read_only=True)
     assert conn.execute("SELECT count(*) FROM gold.plan_summary").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM gold.plan_summary WHERE contract_year = 2025").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM gold.ui_plan_drug_serving WHERE contract_year = 2025").fetchone()[0] == 4
     formulary_summary = conn.execute(
         """
         SELECT
@@ -224,12 +226,16 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert recommendations[0].fit_summary
     assert recommendations[0].monthly_cost_estimate == round(recommendations[0].annual_total_cost / 12, 2)
     assert recommendations[0].feature_version
+    assert recommendations[0].contract_year == 2025
+    assert recommendations[0].benefit_design == "2025_redesign"
     assert recommendations[0].resolved_medications[0].match_source == "exact_name"
     assert recommendations[0].drug_breakdowns[0].coverage_status == "covered"
     assert recommendations[0].drug_breakdowns[0].medication_id
     assert recommendations[0].drug_breakdowns[0].pricing_status == "priced"
     assert recommendations[0].drug_breakdowns[0].fill_traces
     assert recommendations[0].drug_breakdowns[0].fill_traces[0].coverage_phase
+    assert recommendations[0].drug_breakdowns[0].fill_traces[0].benefit_design == "2025_redesign"
+    assert recommendations[0].drug_breakdowns[0].coverage_gap_flag is False
     assert recommendations[1].drug_breakdowns[1].coverage_status == "excluded"
     assert recommendations[1].explanation_groups.coverage_issues
 
@@ -287,7 +293,7 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert config.training_dataset_metadata_path.exists()
     dataset_frame = pd.read_csv(dataset_path)
     assert {"scenario_id", "plan_key", "weak_label_score", "heuristic_score"}.issubset(dataset_frame.columns)
-    assert {"feature_version", "negotiated_price_total", "lis_adjusted_oop_total"}.issubset(dataset_frame.columns)
+    assert {"feature_version", "negotiated_price_total", "lis_adjusted_oop_total", "contract_year", "benefit_design"}.issubset(dataset_frame.columns)
     assert len(dataset_frame) > 0
 
     linear_artifact_path = train_hybrid_reranker(
@@ -309,6 +315,11 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert "tree_reranker" in evaluation["systems"]
     assert "scenario_bundle_metrics" in evaluation
     assert "acceptance" in evaluation
+    assert evaluation["evaluation_mode"] == "held_out_by_scenario"
+    assert evaluation["train_rows"] + evaluation["test_rows"] == len(dataset_frame)
+    assert evaluation["train_scenario_count"] > 0
+    assert evaluation["test_scenario_count"] > 0
+    assert set(evaluation["train_scenarios"]).isdisjoint(evaluation["test_scenarios"])
 
     hybrid_recommendations = recommend_plans(beneficiary, medications, config=config, ranking_mode="hybrid")
     assert len(hybrid_recommendations) == 2

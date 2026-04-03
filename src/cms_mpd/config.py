@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 ENV_PREFIX = "CMS_MPD"
+BENEFIT_DESIGN_MODES = ("auto", "2025_redesign", "2024_standard")
 
 
 def _env_value(name: str, default: str = "") -> str:
@@ -20,6 +21,11 @@ def _env_path(name: str) -> Path | None:
 def _default_build_profile() -> str:
     profile = _env_value(f"{ENV_PREFIX}_BUILD_PROFILE", "full").lower()
     return profile if profile in {"full", "demo"} else "full"
+
+
+def _default_benefit_design_mode() -> str:
+    mode = _env_value(f"{ENV_PREFIX}_BENEFIT_DESIGN_MODE", "auto").lower()
+    return mode if mode in BENEFIT_DESIGN_MODES else "auto"
 
 
 def _default_demo_zipcodes() -> tuple[str, ...]:
@@ -65,12 +71,18 @@ class PipelineConfig:
     )
     db_filename: str = "cms_mpd.duckdb"
     build_profile: str = field(default_factory=_default_build_profile)
+    benefit_design_mode: str = field(default_factory=_default_benefit_design_mode)
     demo_zipcodes: tuple[str, ...] = field(default_factory=_default_demo_zipcodes)
     data_dir: Path | None = None
     source_data_dir: Path | None = None
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root)
+        self.benefit_design_mode = (
+            self.benefit_design_mode.lower()
+            if self.benefit_design_mode.lower() in BENEFIT_DESIGN_MODES
+            else "auto"
+        )
         self.data_dir = Path(self.data_dir) if self.data_dir is not None else _default_data_dir(self.project_root)
         self.source_data_dir = (
             Path(self.source_data_dir)

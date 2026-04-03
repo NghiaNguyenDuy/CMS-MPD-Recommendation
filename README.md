@@ -23,6 +23,7 @@ Detailed technical reference:
 - generates PDE-compatible synthetic beneficiaries into `synthetic.*`
 - estimates annual premium, annual drug OOP, and annual total cost for plan comparison
 - ranks top 5 or top 10 plans with rules-first logic and an optional hybrid reranker
+- defaults to the 2025 redesigned Part D benefit for `2025-Q3` data and supports explicit `2024_standard` historical modeling when needed
 - explains uncovered drugs, insulin risks, pharmacy access limits, PA/ST/QL restrictions, deductible exposure, and comparison-only status in human-readable language
 
 ## Intended Users
@@ -168,7 +169,7 @@ Stable export contract for the Streamlit workflow:
 - data snapshot
 - input summary
 - feature coverage summary
-- top-k outputs
+- top-k outputs, including `contract_year` and `benefit_design` for each exported recommendation
 
 ## Source Data
 
@@ -194,6 +195,7 @@ You can override both output and source roots with environment variables or CLI 
 - `CMS_MPD_DEMO_ZIPCODES`
 - `CMS_MPD_DATA_DIR`
 - `CMS_MPD_SOURCE_DATA_DIR`
+- `CMS_MPD_BENEFIT_DESIGN_MODE` (`auto`, `2025_redesign`, or `2024_standard`)
 
 Example:
 
@@ -242,6 +244,7 @@ Build outputs:
 
 ```powershell
 .venv\Scripts\python.exe -m cms_mpd recommend `
+  --benefit-design-mode auto `
   --zipcode 43004 `
   --age-band 65-74 `
   --lis-status none `
@@ -295,6 +298,8 @@ Evaluate rules, heuristic baseline, and rerankers:
 ```powershell
 .venv\Scripts\python.exe -m cms_mpd evaluate-model
 ```
+
+Evaluation uses a held-out scenario split so the reported reranker metrics are measured on scenarios that were not used for fitting.
 
 Generated assets live under:
 
@@ -362,8 +367,10 @@ Coverage includes:
 ## Current Modeling Assumptions
 
 - CMS source snapshot is local SPUF `2025-Q3`
+- `benefit_design_mode=auto` resolves `2025-Q3` plans to `2025_redesign`; `2024_standard` is available only for historical or what-if use
 - distance is ZIP-centroid based
 - PDE data is used for defaults and research scenarios, not production beneficiary truth
 - rules remain the source of truth for OOP, deductible, LIS, insulin cap handling, uncovered drugs, and channel choice
 - the hybrid reranker only reorders the eligible candidate set
+- evaluation reports are based on a scenario-level held-out split rather than in-sample scoring
 - nearby out-of-area plans may be shown for comparison but are never returned as eligible recommendations

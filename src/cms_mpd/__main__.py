@@ -6,7 +6,7 @@ import logging
 from dataclasses import asdict
 from pathlib import Path
 
-from .config import PipelineConfig
+from .config import BENEFIT_DESIGN_MODES, PipelineConfig
 from .modeling import build_training_dataset, evaluate_hybrid_reranker, train_hybrid_reranker
 from .pipeline import health_check, run_pipeline
 from .recommend import BeneficiaryInput, MedicationInput, recommend_plans
@@ -18,6 +18,7 @@ def _add_config_arguments(
     include_demo_zipcode: bool = False,
 ) -> None:
     parser.add_argument("--build-profile", default="full", choices=["full", "demo"])
+    parser.add_argument("--benefit-design-mode", default="auto", choices=list(BENEFIT_DESIGN_MODES))
     parser.add_argument("--snapshot-quarter", default="2025-Q3")
     parser.add_argument(
         "--data-dir",
@@ -130,6 +131,7 @@ def _build_config(args: argparse.Namespace) -> PipelineConfig:
     demo_zipcodes = tuple(getattr(args, "demo_zipcode", []) or default_config.demo_zipcodes)
     return PipelineConfig(
         build_profile=build_profile,
+        benefit_design_mode=getattr(args, "benefit_design_mode", default_config.benefit_design_mode),
         demo_zipcodes=demo_zipcodes,
         snapshot_quarter=getattr(args, "snapshot_quarter", default_config.snapshot_quarter),
         data_dir=Path(args.data_dir) if getattr(args, "data_dir", None) else None,
