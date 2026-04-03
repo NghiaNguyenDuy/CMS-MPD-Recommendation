@@ -400,6 +400,48 @@ def _fetch_dataframe(
     return conn.execute(query).fetch_df()
 
 
+def _table_has_column(
+    conn: duckdb.DuckDBPyConnection,
+    table_schema: str,
+    table_name: str,
+    column_name: str,
+) -> bool:
+    result = conn.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = ?
+          AND table_name = ?
+          AND column_name = ?
+        LIMIT 1
+        """,
+        [table_schema, table_name, column_name],
+    ).fetchone()
+    return result is not None
+
+
+def _candidate_plan_query(conn: duckdb.DuckDBPyConnection) -> str:
+    contract_year_select = (
+        "ps.contract_year AS contract_year"
+        if _table_has_column(conn, "gold", "plan_summary", "contract_year")
+        else "CAST(NULL AS INTEGER) AS contract_year"
+    )
+    return f"""
+        SELECT DISTINCT
+            psa.plan_key,
+            ps.plan_name,
+            {contract_year_select},
+            ps.annual_premium,
+            ps.deductible,
+            pns.network_flag
+        FROM gold.plan_service_area psa
+        JOIN gold.plan_summary ps ON psa.plan_key = ps.plan_key
+        JOIN gold.plan_network_summary pns ON psa.plan_key = pns.plan_key
+        WHERE psa.zip_code = ?
+        ORDER BY ps.plan_name
+        """
+
+
 def _append_unique(target: list[str], message: str) -> None:
     if message and message not in target:
         target.append(message)
@@ -1583,20 +1625,7 @@ def recommend_plans(
     zipcode = _normalize_zipcode(beneficiary.zipcode)
     candidate_plans = _fetch_dataframe(
         conn,
-        """
-        SELECT DISTINCT
-            psa.plan_key,
-            ps.plan_name,
-            ps.contract_year,
-            ps.annual_premium,
-            ps.deductible,
-            pns.network_flag
-        FROM gold.plan_service_area psa
-        JOIN gold.plan_summary ps ON psa.plan_key = ps.plan_key
-        JOIN gold.plan_network_summary pns ON psa.plan_key = pns.plan_key
-        WHERE psa.zip_code = ?
-        ORDER BY ps.plan_name
-        """,
+        _candidate_plan_query(conn),
         [zipcode],
     )
     if candidate_plans.empty:

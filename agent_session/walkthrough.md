@@ -1,52 +1,38 @@
-# Cost-Realistic Recommendation Flow Walkthrough
+# Counselor Timeline Walkthrough
 
 ## Summary
-The recommendation engine now uses a more realistic annual ledger instead of relying on simple chronological fill ordering and per-fill greedy channel picks. The goal is not to mimic every operational detail of Part D claims, but to produce rankings that are stable, auditable, and easier for counselors to trust.
+The recommendation engine already knew the yearly sequence of fills after the cost-realism sprint. This follow-on work turns that trace data into counselor-facing views so users can see not only which plan ranks highest, but when cost pressure happens and whether the pharmacy-channel path is stable.
 
-## Annual Simulation Flow
-1. Each covered medication is expanded into `ScheduledFillEvent` records with:
-   - medication id
-   - fill number
-   - day offset
-   - deductible applicability
-   - negotiated-price proxy
-   - feasible channels
-2. Events are sorted deterministically by:
-   - day offset
-   - deductible applicability
-   - negotiated-price proxy descending
-   - medication id
-   - fill number
-3. The engine simulates each event against the active benefit design (`2025_redesign` or `2024_standard`) and records a `DrugFillTrace` with a global `sequence_index`.
+## New Timeline Helpers
+- `build_monthly_timeline_frame(recommendation)` buckets audited fill traces into a 12-month relative plan-year view.
+- Each month now shows:
+  - drug OOP
+  - deductible applied
+  - monthly premium
+  - projected monthly total
+  - cumulative drug OOP
+  - cumulative total
+  - fill count
+  - filled drugs
+- `summarize_drug_channel_path(breakdown)` turns raw channel traces into readable medication-level explanations such as a stable preferred-retail path or a switching retail-to-mail path.
 
-## Channel Selection Flow
-- Every feasible channel is still priced for the fill.
-- The chosen channel now follows a stable policy:
-  - lowest projected OOP first
-  - keep the previous medication channel when within the `$1.00` tolerance
-  - prefer preferred-network channels
-  - then honor retail-vs-mail preference
-- Medication-level channel switches are counted and surfaced as `channel_switch_count` in recommendation outputs.
+## Streamlit Surface
+- Plan detail expanders now show two charts:
+  - monthly cash-flow bars
+  - cumulative OOP / total-cost timeline lines
+- The drug-by-drug table now includes a `Channel path` column built from each medication's fill trace sequence.
+- The side-by-side comparison table now carries the operational metadata that became important after the cost-realism sprint:
+  - priced medications
+  - channel switches
+  - channel mix
+  - simulation policy
 
-## Recommendation Ranking Flow
-- Plans are no longer sorted only by full-vs-partial coverage and fit score.
-- The rules engine now buckets plans into:
-  - fully covered and fully priceable
-  - eligible but needs verification
-  - fallback only
-- `priced_drug_count` helps separate plans that produced real pricing evidence from plans that only remain as weak comparisons.
-- Hybrid reranking, when enabled, preserves those bucket boundaries and reranks only within them.
+## Why This Matters
+- Counselors can now distinguish a low annual total from a plan that creates an early deductible spike.
+- Channel stability is visible without reading raw fill traces or explanation groups.
+- The UI now better reflects the rules engine's actual logic instead of flattening everything into one annual number.
 
-## Audit Surface
-- `DrugFillTrace.sequence_index` makes deductible and OOP transitions auditable.
-- `PlanRecommendation` now exposes:
-  - `priced_drug_count`
-  - `channel_switch_count`
-  - `simulation_policy`
-  - `contract_year`
-  - `benefit_design`
-- Dataframe exports and run-audit payloads now carry the same fields so counselor-facing analysis can trace how a recommendation was formed.
-
-## Validation Snapshot
-- Focused tests cover deterministic sequencing, deductible-first ordering on same-day fills, near-tie channel continuity, and bucket-aware ranking.
-- Smoke coverage confirms recommendation output is stable even when medication input order is reversed.
+## Remaining Next Steps
+- Decide whether monthly timelines should become downloadable structured outputs.
+- Consider adding monthly-variance features to model training.
+- Add scenario toggles for channel-stability vs lowest-single-fill-cost preferences.

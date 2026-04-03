@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import duckdb
+
 from cms_mpd.recommend import (
+    DrugFillTrace,
     FillCostResult,
     MedicationMatch,
     PlanDrugBreakdown,
@@ -9,10 +12,13 @@ from cms_mpd.recommend import (
     PlanFitMetrics,
     PlanRecommendation,
     _build_scheduled_fill_events,
+    _candidate_plan_query,
     _rules_ranking_sort_key,
     _scheduled_fill_sort_key,
     _select_best_channel_result,
 )
+
+from cms_mpd.modeling import _monthly_cost_variance_features
 
 
 def _channel_summary() -> dict[str, float | bool]:
@@ -240,3 +246,95 @@ def test_rules_sort_key_prefers_priceable_plan_over_fallback():
     ordered = sorted([fallback_only, needs_verification], key=_rules_ranking_sort_key)
 
     assert [item.plan_key for item in ordered] == ["P1", "P2"]
+
+
+def test_candidate_plan_query_falls_back_when_contract_year_column_is_missing():
+    conn = duckdb.connect()
+    conn.execute("CREATE SCHEMA gold")
+    conn.execute("CREATE TABLE gold.plan_service_area(plan_key VARCHAR, zip_code VARCHAR)")
+    conn.execute(
+        """
+        CREATE TABLE gold.plan_summary(
+            plan_key VARCHAR,
+            plan_name VARCHAR,
+            annual_premium DOUBLE,
+            deductible DOUBLE,
+            contract_id VARCHAR
+        )
+        """
+    )
+    conn.execute("CREATE TABLE gold.plan_network_summary(plan_key VARCHAR, network_flag VARCHAR)")
+    conn.execute("INSERT INTO gold.plan_service_area VALUES ('P1', '43001')")
+    conn.execute("INSERT INTO gold.plan_summary VALUES ('P1', 'Legacy Plan', 240.0, 100.0, 'H1000')")
+    conn.execute("INSERT INTO gold.plan_network_summary VALUES ('P1', 'adequate')")
+
+    frame = conn.execute(_candidate_plan_query(conn), ['43001']).fetch_df()
+
+    assert list(frame.columns) == [
+        'plan_key',
+        'plan_name',
+        'contract_year',
+        'annual_premium',
+        'deductible',
+        'network_flag',
+    ]
+    assert frame.iloc[0]['plan_name'] == 'Legacy Plan'
+    assert frame['contract_year'].isna().all()
+    conn.close()
+
+
+
+def test_monthly_variance_features_capture_priceability_and_timing():
+    recommendation = _recommendation(
+        "P3",
+        coverage_status="partial",
+        priced_drug_count=1,
+        requested_drug_count=2,
+    )
+    recommendation.annual_premium = 120.0
+    recommendation.drug_breakdowns[0].fill_traces = [
+        DrugFillTrace(
+            fill_number=1,
+            day_offset=0,
+            sequence_index=1,
+            selected_channel="pref_retail",
+            coverage_phase="initial_coverage",
+            pricing_status="priced",
+            negotiated_price=100.0,
+            deductible_before=0.0,
+            deductible_applied=0.0,
+            deductible_after=0.0,
+            base_oop=40.0,
+            initial_coverage_oop=40.0,
+            lis_adjusted_oop=40.0,
+            final_oop=40.0,
+            oop_before=0.0,
+            oop_after=40.0,
+            oop_cap_applied=False,
+        ),
+        DrugFillTrace(
+            fill_number=2,
+            day_offset=45,
+            sequence_index=2,
+            selected_channel="pref_retail",
+            coverage_phase="initial_coverage",
+            pricing_status="priced",
+            negotiated_price=100.0,
+            deductible_before=0.0,
+            deductible_applied=0.0,
+            deductible_after=0.0,
+            base_oop=10.0,
+            initial_coverage_oop=10.0,
+            lis_adjusted_oop=10.0,
+            final_oop=10.0,
+            oop_before=40.0,
+            oop_after=50.0,
+            oop_cap_applied=False,
+        ),
+    ]
+
+    features = _monthly_cost_variance_features(recommendation)
+
+    assert features["priced_drug_share"] == 0.5
+    assert features["monthly_drug_oop_variance"] > 0.0
+    assert features["monthly_total_variance"] == features["monthly_drug_oop_variance"]

@@ -6,6 +6,7 @@ import sys
 import uuid
 from pathlib import Path
 
+import altair as alt
 import duckdb
 import pandas as pd
 import streamlit as st
@@ -25,14 +26,18 @@ from cms_mpd.app_support import (
     PRIMARY_GOALS,
     ROLE_MAP,
     append_medication_row,
-    build_medication_row_from_catalog,
     build_counselor_note,
+    build_medication_row_from_catalog,
+    build_monthly_timeline_frame,
     build_side_by_side_frame,
+    catalog_available_day_supply_options,
+    catalog_tier_family_options,
     coerce_zipcode,
     format_drug_catalog_option,
     haversine_miles,
     parse_medication_frame,
     search_drug_catalog,
+    summarize_drug_channel_path,
     summarize_evidence_gaps,
 )
 from cms_mpd.decision_support import (
@@ -200,6 +205,15 @@ def get_drug_catalog(db_path: str) -> pd.DataFrame:
             )
             WHERE rn = 1
         ),
+        tier_options AS (
+            SELECT
+                ndc,
+                list(DISTINCT tier_family) AS available_tier_family_options
+            FROM silver.fact_plan_drug_coverage
+            WHERE ndc IS NOT NULL
+              AND tier_family IS NOT NULL
+            GROUP BY 1
+        ),
         defaults_ranked AS (
             SELECT
                 ndc,
@@ -214,6 +228,15 @@ def get_drug_catalog(db_path: str) -> pd.DataFrame:
                 ) AS rn
             FROM gold.drug_input_defaults
             WHERE ndc IS NOT NULL
+        ),
+        day_supply_options AS (
+            SELECT
+                ndc,
+                list(DISTINCT days_supply) AS available_day_supply_options
+            FROM gold.drug_input_defaults
+            WHERE ndc IS NOT NULL
+              AND days_supply IS NOT NULL
+            GROUP BY 1
         ),
         reference_ranked AS (
             SELECT
@@ -237,6 +260,8 @@ def get_drug_catalog(db_path: str) -> pd.DataFrame:
             ref.ndc,
             coalesce(tm.tier_family, 'brand') AS tier_family,
             coalesce(defs.days_supply, 30) AS default_day_supply,
+            dso.available_day_supply_options,
+            topts.available_tier_family_options,
             coalesce(cov.plan_coverage, 0) AS plan_coverage,
             CAST(coalesce(cov.is_insulin, ref.is_insulin, FALSE) AS BOOLEAN) AS is_insulin
         FROM reference_ranked ref
@@ -244,9 +269,13 @@ def get_drug_catalog(db_path: str) -> pd.DataFrame:
           ON ref.ndc = cov.ndc
         LEFT JOIN tier_mode tm
           ON ref.ndc = tm.ndc
+        LEFT JOIN tier_options topts
+          ON ref.ndc = topts.ndc
         LEFT JOIN defaults_ranked defs
           ON ref.ndc = defs.ndc
          AND defs.rn = 1
+        LEFT JOIN day_supply_options dso
+          ON ref.ndc = dso.ndc
         WHERE ref.rn = 1
         ORDER BY plan_coverage DESC, ref.drug_name, ref.ndc
         """
@@ -372,6 +401,49 @@ def _render_metric_cards(frame: pd.DataFrame) -> None:
         )
 
 
+def _render_monthly_timeline_charts(timeline_frame: pd.DataFrame) -> None:
+    if timeline_frame.empty:
+        return
+    month_order = timeline_frame["Month"].tolist()
+    cash_flow_frame = timeline_frame[["Month", "Month number", "Drug OOP", "Projected monthly total"]].melt(
+        id_vars=["Month", "Month number"],
+        value_vars=["Drug OOP", "Projected monthly total"],
+        var_name="Metric",
+        value_name="Amount",
+    )
+    cumulative_frame = timeline_frame[["Month", "Month number", "Cumulative drug OOP", "Cumulative total"]].melt(
+        id_vars=["Month", "Month number"],
+        value_vars=["Cumulative drug OOP", "Cumulative total"],
+        var_name="Metric",
+        value_name="Amount",
+    )
+    x_encoding = alt.X("Month:N", sort=month_order, title="Month")
+    cash_flow_chart = (
+        alt.Chart(cash_flow_frame)
+        .mark_bar()
+        .encode(
+            x=x_encoding,
+            y=alt.Y("Amount:Q", title="Dollars"),
+            color=alt.Color("Metric:N", title="Series"),
+            xOffset="Metric:N",
+            tooltip=["Month", "Metric", alt.Tooltip("Amount:Q", format=",.2f")],
+        )
+    )
+    cumulative_chart = (
+        alt.Chart(cumulative_frame)
+        .mark_line(point=True)
+        .encode(
+            x=x_encoding,
+            y=alt.Y("Amount:Q", title="Dollars"),
+            color=alt.Color("Metric:N", title="Series"),
+            tooltip=["Month", "Metric", alt.Tooltip("Amount:Q", format=",.2f")],
+        )
+    )
+    chart_cols = st.columns(2)
+    chart_cols[0].altair_chart(cash_flow_chart, use_container_width=True)
+    chart_cols[1].altair_chart(cumulative_chart, use_container_width=True)
+
+
 def _render_plan_details(recommendations: list) -> None:
     for recommendation in recommendations[:5]:
         with st.expander(
@@ -382,6 +454,11 @@ def _render_plan_details(recommendations: list) -> None:
             metric_cols[1].metric("Annual OOP", f"${recommendation.estimated_annual_oop:,.0f}")
             metric_cols[2].metric("Annual premium", f"${recommendation.annual_premium:,.0f}")
             metric_cols[3].metric("Fit score", f"{recommendation.fit_score:,.1f}")
+            timeline_cols = st.columns(4)
+            timeline_cols[0].metric("Priced meds", f"{recommendation.priced_drug_count}")
+            timeline_cols[1].metric("Channel switches", f"{recommendation.channel_switch_count}")
+            timeline_cols[2].metric("Benefit design", recommendation.benefit_design)
+            timeline_cols[3].metric("Simulation policy", recommendation.simulation_policy)
             st.write(recommendation.fit_summary)
             st.write(recommendation.network_access_summary)
             if recommendation.key_strengths:
@@ -410,6 +487,17 @@ def _render_plan_details(recommendations: list) -> None:
                     for item in items:
                         st.write(f"- {item}")
 
+            timeline_frame = build_monthly_timeline_frame(recommendation)
+            if not timeline_frame.empty:
+                st.markdown("**Monthly cash-flow view**")
+                st.caption("Month buckets are relative to the simulated plan year and combine premium plus projected drug cost-sharing.")
+                _render_monthly_timeline_charts(timeline_frame)
+                st.dataframe(
+                    timeline_frame.drop(columns=["Month number"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
             drug_rows = pd.DataFrame(
                 [
                     {
@@ -419,6 +507,7 @@ def _render_plan_details(recommendations: list) -> None:
                         "Coverage status": breakdown.coverage_status,
                         "Pricing status": breakdown.pricing_status,
                         "Annual OOP": breakdown.annual_oop,
+                        "Channel path": summarize_drug_channel_path(breakdown),
                         "Prior auth": breakdown.pa_flag,
                         "Step therapy": breakdown.st_flag,
                         "Quantity limit": breakdown.ql_flag,
@@ -631,15 +720,18 @@ def main() -> None:
                     index=default_day_supply_index,
                     key="medication_catalog_day_supply",
                 )
+                tier_family_options = catalog_tier_family_options(selected_row)
+                default_tier_family = str(selected_row.get("tier_family") or tier_family_options[0]).strip().lower()
+                try:
+                    default_tier_family_index = tier_family_options.index(default_tier_family)
+                except ValueError:
+                    default_tier_family_index = 0
                 selected_tier_family = picker_cols[1].selectbox(
                     "Tier family for add",
-                    options=["generic", "brand", "specialty"],
-                    index=["generic", "brand", "specialty"].index(
-                        str(selected_row.get("tier_family") or "brand")
-                        if str(selected_row.get("tier_family") or "brand") in {"generic", "brand", "specialty"}
-                        else "brand"
-                    ),
+                    options=tier_family_options,
+                    index=default_tier_family_index,
                     key="medication_catalog_tier_family",
+                    disabled=len(tier_family_options) == 1,
                 )
                 if picker_cols[2].button("Add selected drug", use_container_width=True):
                     st.session_state["medication_editor_rows"] = append_medication_row(
@@ -650,17 +742,15 @@ def main() -> None:
                             tier_family=selected_tier_family,
                         ),
                     )
-                preview_cols = [
-                    "drug_name",
-                    "drug_synonym",
-                    "rxcui",
-                    "ndc",
-                    "tier_family",
-                    "default_day_supply",
-                    "plan_coverage",
-                    "is_insulin",
-                ]
-                st.dataframe(matches[preview_cols], use_container_width=True, hide_index=True)
+                available_day_supply = ", ".join(
+                    f"{value}-day" for value in catalog_available_day_supply_options(selected_row)
+                )
+                available_tiers = ", ".join(tier_family_options)
+                st.caption(
+                    f"Available in {int(selected_row.get('plan_coverage') or 0):,} plans. "
+                    f"Observed day-supply options: {available_day_supply}. "
+                    f"Available tier families: {available_tiers}."
+                )
 
         editor_source = pd.DataFrame(st.session_state.get("medication_editor_rows", DEFAULT_MEDICATION_ROWS))
         med_editor = st.data_editor(

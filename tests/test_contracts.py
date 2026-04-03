@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from cms_mpd.app_support import (
     append_medication_row,
-    build_medication_row_from_catalog,
     build_counselor_note,
+    build_medication_row_from_catalog,
+    build_monthly_timeline_frame,
     build_side_by_side_frame,
+    catalog_available_day_supply_options,
+    catalog_tier_family_options,
     format_drug_catalog_option,
     parse_medication_frame,
     search_drug_catalog,
+    summarize_drug_channel_path,
     summarize_evidence_gaps,
 )
 from cms_mpd.config import PipelineConfig
@@ -294,6 +299,84 @@ def test_parse_medication_frame_validates_rows():
     assert any("day_supply must be 30, 60, or 90" in message for message in errors)
 
 
+def test_monthly_timeline_and_channel_path_helpers():
+    recommendation = _sample_recommendation(
+        plan_key="P4",
+        plan_name="Delta Guided",
+        annual_total_cost=1320.0,
+        annual_premium=360.0,
+        annual_drug_oop=960.0,
+    )
+    recommendation.channel_switch_count = 1
+    recommendation.drug_breakdowns[0].fill_traces = [
+        DrugFillTrace(
+            fill_number=1,
+            day_offset=0,
+            sequence_index=1,
+            selected_channel="pref_retail",
+            coverage_phase="initial_coverage",
+            pricing_status="priced",
+            negotiated_price=25.0,
+            deductible_before=100.0,
+            deductible_applied=10.0,
+            deductible_after=90.0,
+            base_oop=10.0,
+            initial_coverage_oop=10.0,
+            lis_adjusted_oop=10.0,
+            final_oop=10.0,
+            oop_before=0.0,
+            oop_after=10.0,
+            oop_cap_applied=False,
+        ),
+        DrugFillTrace(
+            fill_number=2,
+            day_offset=45,
+            sequence_index=2,
+            selected_channel="pref_mail",
+            coverage_phase="initial_coverage",
+            pricing_status="priced",
+            negotiated_price=20.0,
+            deductible_before=90.0,
+            deductible_applied=0.0,
+            deductible_after=90.0,
+            base_oop=8.0,
+            initial_coverage_oop=8.0,
+            lis_adjusted_oop=8.0,
+            final_oop=8.0,
+            oop_before=10.0,
+            oop_after=18.0,
+            oop_cap_applied=False,
+        ),
+    ]
+
+    timeline = build_monthly_timeline_frame(recommendation)
+    channel_path = summarize_drug_channel_path(recommendation.drug_breakdowns[0])
+
+    assert list(timeline.columns) == [
+        "Month",
+        "Month number",
+        "Drug OOP",
+        "Deductible applied",
+        "Monthly premium",
+        "Projected monthly total",
+        "Cumulative drug OOP",
+        "Cumulative total",
+        "Fill count",
+        "Filled drugs",
+    ]
+    assert timeline.iloc[0]["Month"] == "Jan"
+    assert timeline.iloc[1]["Month"] == "Feb"
+    assert timeline.iloc[0]["Month number"] == 1
+    assert timeline.iloc[1]["Month number"] == 2
+    assert timeline.iloc[0]["Drug OOP"] == 10.0
+    assert timeline.iloc[1]["Drug OOP"] == 8.0
+    assert timeline.iloc[0]["Deductible applied"] == 10.0
+    assert timeline.iloc[1]["Cumulative drug OOP"] == 18.0
+    assert timeline.iloc[0]["Projected monthly total"] == 40.0
+    assert "Switches 1 time(s)" in channel_path
+    assert "preferred retail -> preferred mail" in channel_path
+
+
 def test_drug_catalog_search_and_add_row_helpers():
     catalog = pd.DataFrame(
         [
@@ -304,6 +387,8 @@ def test_drug_catalog_search_and_add_row_helpers():
                 "ndc": "00000000002",
                 "tier_family": "brand",
                 "default_day_supply": 30,
+                "available_day_supply_options": [30, 90],
+                "available_tier_family_options": ["brand", "specialty"],
                 "plan_coverage": 120,
                 "is_insulin": True,
             },
@@ -314,6 +399,8 @@ def test_drug_catalog_search_and_add_row_helpers():
                 "ndc": "00000000001",
                 "tier_family": "generic",
                 "default_day_supply": 90,
+                "available_day_supply_options": [30, 60, 90],
+                "available_tier_family_options": ["generic"],
                 "plan_coverage": 98,
                 "is_insulin": False,
             },
@@ -325,12 +412,20 @@ def test_drug_catalog_search_and_add_row_helpers():
 
     option_label = format_drug_catalog_option(matches.iloc[0])
     assert "insulin glargine" in option_label
-    assert "30-day default" in option_label
+    assert "days 30/90" in option_label
+    assert "tiers brand, specialty" in option_label
+    assert catalog_available_day_supply_options(matches.iloc[0]) == [30, 90]
+    assert catalog_tier_family_options(matches.iloc[0]) == ["brand", "specialty"]
 
-    new_row = build_medication_row_from_catalog(matches.iloc[0], day_supply=60, tier_family="brand")
+    array_row = matches.iloc[0].to_dict()
+    array_row["available_tier_family_options"] = np.array(["brand", "specialty"], dtype=object)
+    assert catalog_tier_family_options(array_row) == ["brand", "specialty"]
+
+    new_row = build_medication_row_from_catalog(matches.iloc[0], day_supply=60, tier_family="generic")
     assert new_row["drug_name"] == "insulin glargine"
     assert new_row["rxcui"] == "222222"
     assert new_row["day_supply"] == 60
+    assert new_row["tier_family"] == "brand"
 
     updated_rows = append_medication_row([], new_row)
     assert len(updated_rows) == 1
@@ -407,6 +502,9 @@ def test_decision_support_exports_and_counselor_note():
     side_by_side = build_side_by_side_frame(combined, selected_plan_keys=["P1", "P3"])
     assert list(side_by_side.columns) == ["Metric", "Alpha Choice", "Gamma Nearby"]
     assert "Annual total cost" in side_by_side["Metric"].tolist()
+    assert "Priced medications" in side_by_side["Metric"].tolist()
+    assert "Channel switches" in side_by_side["Metric"].tolist()
+    assert "Channel mix" in side_by_side["Metric"].tolist()
 
     feature_coverage = summarize_feature_coverage(eligible_recommendations, comparison_recommendations)
     assert feature_coverage["candidate_plans"] == 3
@@ -469,5 +567,6 @@ def test_decision_support_exports_and_counselor_note():
         "selected_channel_mix",
     }.issubset(audit.top_k_outputs[0])
     assert "Alpha Choice" in note
+    assert "stable pharmacy channel pattern" in note
     assert "comparison-only" in note
     assert any("Hybrid reranker score not available" in gap for gap in gaps)

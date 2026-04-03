@@ -304,7 +304,16 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert config.training_dataset_metadata_path.exists()
     dataset_frame = pd.read_csv(dataset_path)
     assert {"scenario_id", "plan_key", "weak_label_score", "heuristic_score"}.issubset(dataset_frame.columns)
-    assert {"feature_version", "negotiated_price_total", "lis_adjusted_oop_total", "contract_year", "benefit_design"}.issubset(dataset_frame.columns)
+    assert {
+        "feature_version",
+        "negotiated_price_total",
+        "lis_adjusted_oop_total",
+        "contract_year",
+        "benefit_design",
+        "priced_drug_share",
+        "monthly_drug_oop_variance",
+        "monthly_total_variance",
+    }.issubset(dataset_frame.columns)
     assert len(dataset_frame) > 0
 
     linear_artifact_path = train_hybrid_reranker(

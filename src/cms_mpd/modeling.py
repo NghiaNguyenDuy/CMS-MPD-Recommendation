@@ -16,7 +16,7 @@ from .config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
-DATASET_SCHEMA_VERSION = "request_features_v3"
+DATASET_SCHEMA_VERSION = "request_features_v4"
 WEAK_LABEL_VERSION = "weak_label_v2"
 TREE_MODEL_TYPE = "tree"
 LINEAR_MODEL_TYPE = "linear"
@@ -47,6 +47,7 @@ MODEL_NUMERIC_COLUMNS = [
     "requested_drug_count",
     "covered_drug_count_request",
     "covered_drug_share",
+    "priced_drug_share",
     "uncovered_drug_count",
     "uncovered_drug_share",
     "priced_drug_count",
@@ -64,6 +65,8 @@ MODEL_NUMERIC_COLUMNS = [
     "channel_unavailable_share",
     "mail_order_dependency_flag",
     "mail_order_dependency_share",
+    "monthly_drug_oop_variance",
+    "monthly_total_variance",
     "channel_switch_count",
     "insulin_risk_flag",
     "insulin_nonpreferred_dependency_count",
@@ -133,6 +136,7 @@ FEATURE_SUBSETS = {
             "requested_drug_count",
             "covered_drug_count_request",
             "covered_drug_share",
+            "priced_drug_share",
             "uncovered_drug_count",
             "uncovered_drug_share",
             "restriction_count",
@@ -142,6 +146,8 @@ FEATURE_SUBSETS = {
             "missing_price_drug_share",
             "channel_unavailable_count",
             "channel_unavailable_share",
+            "monthly_drug_oop_variance",
+            "monthly_total_variance",
             "insulin_risk_flag",
             "insulin_nonpreferred_dependency_count",
             "insulin_nonpreferred_dependency_share",
@@ -168,6 +174,7 @@ FEATURE_SUBSETS = {
             "requested_drug_count",
             "covered_drug_count_request",
             "covered_drug_share",
+            "priced_drug_share",
             "uncovered_drug_count",
             "uncovered_drug_share",
             "restriction_count",
@@ -177,6 +184,8 @@ FEATURE_SUBSETS = {
             "missing_price_drug_share",
             "channel_unavailable_count",
             "channel_unavailable_share",
+            "monthly_drug_oop_variance",
+            "monthly_total_variance",
             "insulin_risk_flag",
             "insulin_nonpreferred_dependency_count",
             "insulin_nonpreferred_dependency_share",
@@ -652,6 +661,22 @@ def _summarize_matches(matches: list[Any]) -> dict[str, float]:
     }
 
 
+def _monthly_cost_variance_features(recommendation: Any) -> dict[str, float]:
+    monthly_drug_oop = np.zeros(12, dtype=float)
+    monthly_premium = float(recommendation.annual_premium) / 12.0
+    for breakdown in recommendation.drug_breakdowns:
+        for trace in getattr(breakdown, "fill_traces", []):
+            month_index = max(0, min(11, int(float(trace.day_offset) // 30)))
+            monthly_drug_oop[month_index] += float(trace.final_oop)
+    monthly_total = monthly_drug_oop + monthly_premium
+    requested_drug_count = max(1, len(recommendation.drug_breakdowns))
+    return {
+        "priced_drug_share": float(recommendation.priced_drug_count / requested_drug_count),
+        "monthly_drug_oop_variance": float(np.var(monthly_drug_oop)),
+        "monthly_total_variance": float(np.var(monthly_total)),
+    }
+
+
 def _recommendations_to_feature_rows(
     conn: duckdb.DuckDBPyConnection,
     recommendations: list[Any],
@@ -705,6 +730,7 @@ def _recommendations_to_feature_rows(
             if item.insulin_flag and item.selected_channel in {"nonpref_retail", "nonpref_mail"}
         )
         match_summary = _summarize_matches(recommendation.resolved_medications)
+        monthly_variance = _monthly_cost_variance_features(recommendation)
         row = {
             "scenario_id": scenario_id,
             "scenario_bundle": scenario_bundle,
@@ -725,6 +751,7 @@ def _recommendations_to_feature_rows(
             "requested_drug_count": float(requested_drug_count),
             "covered_drug_count_request": float(covered_drug_count_request),
             "covered_drug_share": float(covered_drug_count_request / requested_drug_count),
+            "priced_drug_share": monthly_variance["priced_drug_share"],
             "uncovered_drug_count": float(recommendation.uncovered_drug_count),
             "uncovered_drug_share": float(recommendation.uncovered_drug_count / requested_drug_count),
             "priced_drug_count": float(recommendation.priced_drug_count),
@@ -742,6 +769,8 @@ def _recommendations_to_feature_rows(
             "channel_unavailable_share": float(channel_unavailable_count / requested_drug_count),
             "mail_order_dependency_flag": float(1 if mail_order_count > 0 else 0),
             "mail_order_dependency_share": float(mail_order_count / requested_drug_count),
+            "monthly_drug_oop_variance": monthly_variance["monthly_drug_oop_variance"],
+            "monthly_total_variance": monthly_variance["monthly_total_variance"],
             "channel_switch_count": float(recommendation.channel_switch_count),
             "insulin_risk_flag": float(1 if recommendation.insulin_flag else 0),
             "insulin_nonpreferred_dependency_count": float(insulin_nonpreferred_dependency_count),

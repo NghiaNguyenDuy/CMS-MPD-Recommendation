@@ -1,39 +1,25 @@
 # Enhancement Execution Tracker
 
 ## Status
-- The correctness-first benefit-design refresh is complete and remains the active default.
-- The cost-realism recommendation-flow sprint is now implemented in the rules engine and supporting exports.
-- Recommendations continue to be rules-first, with hybrid reranking constrained to the stronger rules output.
+- The correctness-first benefit-design refresh remains the active default.
+- The cost-realism recommendation-flow sprint is complete.
+- Counselor-facing outputs now expose monthly cash-flow timing and medication-level channel-path behavior from the same audited fill traces.
 
-## Completed Cost-Realism Sprint
-- [x] Extract annual fill scheduling into explicit `ScheduledFillEvent` helpers.
-- [x] Replace simple day-only ordering with deterministic sequencing:
-  - day offset ascending
-  - deductible-applicable fills before deductible-exempt fills on the same day
-  - higher negotiated-price proxy first within the same deductible bucket
-  - medication id and fill number as stable tiebreakers
-- [x] Record `sequence_index` on every `DrugFillTrace` so annual transitions are auditable.
-- [x] Replace pure greedy per-fill channel choice with a stable policy:
-  - lowest projected fill OOP first
-  - keep the previous medication channel when within the `$1.00` near-tie tolerance
-  - then prefer preferred-network channels
-  - then respect beneficiary retail-vs-mail preference
-- [x] Count medication-level channel switches and carry them into plan scoring, watchouts, and exports.
-- [x] Add explicit recommendation buckets in the rules ranking flow:
-  - fully covered and fully priceable
-  - eligible but needs verification
-  - fallback only
-- [x] Track `priced_drug_count` and use it in recommendation ordering.
-- [x] Add `priced_drug_count`, `channel_switch_count`, and `simulation_policy` to recommendation exports and audits.
-- [x] Align hybrid reranking with the new internal buckets and stronger rules output.
-- [x] Add focused regression coverage for sequencing, channel stability, ranking buckets, and order invariance.
+## Completed Counselor Timeline Sprint
+- [x] Add reusable monthly cash-flow timeline helpers derived from plan fill traces.
+- [x] Surface deductible exposure and cumulative OOP timing in counselor-facing plan details.
+- [x] Surface medication-level channel-path summaries, including channel switches, directly in the detailed drug view.
+- [x] Expand side-by-side comparison to include priced-med count, channel switches, channel mix, and simulation policy.
+- [x] Update counselor notes so they mention priceability and annual channel stability when available.
+- [x] Add contract coverage for monthly timeline aggregation and channel-path summaries.
 
 ## Validation Snapshot
-- Focused regression coverage now includes deterministic fill sequencing, near-tie channel continuity, rules-ranking bucket order, export contracts, and smoke-path integration.
-- Latest targeted verification: `10 passed` across contract, smoke, and recommendation-flow realism tests.
+- Targeted counselor-output verification passed on contracts and smoke paths.
+- Latest focused verification for this sprint: `7 passed`.
+- The full suite remained green after the previous recommendation-flow sprint and should stay the final verification step for any further work.
 
-## Follow-On Opportunities
-- [ ] Add richer monthly cash-flow views and deductible/OOP timelines to counselor outputs.
-- [ ] Surface medication-level channel-switch explanations directly in UI comparison views.
+## Remaining Follow-On Opportunities
 - [ ] Explore whether reranker training should use explicit `priced_drug_share` or monthly variance features.
 - [ ] Expand scenario-analysis tooling for beneficiary what-if comparisons.
+- [ ] Add counselor-facing scenario toggles for stable channel preference vs lowest projected single-fill OOP.
+- [ ] Add downloadable monthly timeline extracts to the public CSV/audit surfaces if operational users need them outside Streamlit.

@@ -8,7 +8,7 @@ import math
 import pandas as pd
 
 from .decision_support import MedicationListItem, PreferenceWeights, ProfileInput
-from .recommend import MedicationInput
+from .recommend import MedicationInput, PlanDrugBreakdown, PlanRecommendation
 
 
 DEFAULT_MEDICATION_ROWS = [
@@ -41,11 +41,20 @@ PRIMARY_GOALS = [
     "Easiest pharmacy access",
     "Conservative compare and verify",
 ]
+SUPPORTED_TIER_FAMILY_OPTIONS = ("generic", "brand", "specialty")
 ROLE_MAP = {
     "Beneficiary": "beneficiary",
     "Caregiver": "caregiver",
     "Counselor": "counselor",
 }
+CHANNEL_LABELS = {
+    "pref_retail": "preferred retail",
+    "nonpref_retail": "non-preferred retail",
+    "pref_mail": "preferred mail",
+    "nonpref_mail": "non-preferred mail",
+    "unavailable": "unavailable",
+}
+MONTH_LABELS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 FOCUS_MAP = {
     "Balanced recommendation": "balanced",
     "Lowest annual cost": "lowest_total_cost",
@@ -136,6 +145,59 @@ def parse_medication_frame(
     return medications, contract_rows, errors
 
 
+def _coerce_catalog_option_list(values: object) -> list[object]:
+    if values is None:
+        return []
+    if isinstance(values, list):
+        raw_values = values
+    elif isinstance(values, tuple):
+        raw_values = list(values)
+    elif hasattr(values, "tolist") and not isinstance(values, str):
+        converted = values.tolist()
+        raw_values = converted if isinstance(converted, list) else [converted]
+    elif isinstance(values, str):
+        raw_values = [part.strip() for part in values.split(",") if part.strip()]
+    else:
+        try:
+            if pd.isna(values):
+                return []
+        except (TypeError, ValueError):
+            pass
+        raw_values = [values]
+    return [value for value in raw_values if value not in {None, ""}]
+
+
+def catalog_available_day_supply_options(row: pd.Series | dict) -> list[int]:
+    values = row if isinstance(row, dict) else row.to_dict()
+    parsed: list[int] = []
+    for value in _coerce_catalog_option_list(values.get("available_day_supply_options")):
+        try:
+            parsed.append(int(float(value)))
+        except (TypeError, ValueError):
+            continue
+    normalized = sorted({value for value in parsed if value in {30, 60, 90}})
+    if normalized:
+        return normalized
+    try:
+        fallback = int(values.get("default_day_supply") or 30)
+    except (TypeError, ValueError):
+        fallback = 30
+    return [fallback if fallback in {30, 60, 90} else 30]
+
+
+def catalog_tier_family_options(row: pd.Series | dict) -> list[str]:
+    values = row if isinstance(row, dict) else row.to_dict()
+    parsed = [
+        str(value).strip().lower()
+        for value in _coerce_catalog_option_list(values.get("available_tier_family_options"))
+        if str(value).strip().lower() in SUPPORTED_TIER_FAMILY_OPTIONS
+    ]
+    if not parsed:
+        fallback = str(values.get("tier_family") or "brand").strip().lower() or "brand"
+        parsed = [fallback if fallback in SUPPORTED_TIER_FAMILY_OPTIONS else "brand"]
+    return [option for option in SUPPORTED_TIER_FAMILY_OPTIONS if option in set(parsed)]
+
+
 def search_drug_catalog(
     catalog: pd.DataFrame,
     query: str,
@@ -195,14 +257,15 @@ def format_drug_catalog_option(row: pd.Series | dict) -> str:
     else:
         values = row.to_dict()
     drug_name = str(values.get("drug_name") or values.get("ndc") or "Unknown drug")
-    tier_family = str(values.get("tier_family") or "brand")
     default_day_supply = int(values.get("default_day_supply") or 30)
+    available_day_supplies = "/".join(str(value) for value in catalog_available_day_supply_options(values))
+    tier_family_options = ", ".join(catalog_tier_family_options(values))
     insulin_tag = " | insulin" if bool(values.get("is_insulin")) else ""
     coverage = int(values.get("plan_coverage") or 0)
     rxcui = str(values.get("rxcui") or "")
     return (
-        f"{drug_name} | {tier_family} | {default_day_supply}-day default | "
-        f"{coverage:,} plans{insulin_tag}"
+        f"{drug_name} | {coverage:,} plans | days {available_day_supplies} | tiers {tier_family_options} | "
+        f"{default_day_supply}-day default{insulin_tag}"
         + (f" | RXCUI {rxcui}" if rxcui else "")
     )
 
@@ -217,11 +280,15 @@ def build_medication_row_from_catalog(
     selected_day_supply = int(day_supply or values.get("default_day_supply") or 30)
     if selected_day_supply not in {30, 60, 90}:
         selected_day_supply = 30 if selected_day_supply < 45 else (60 if selected_day_supply < 75 else 90)
+    available_tier_families = catalog_tier_family_options(values)
+    requested_tier_family = str(tier_family or values.get("tier_family") or "brand").strip().lower() or "brand"
+    if requested_tier_family not in available_tier_families:
+        requested_tier_family = available_tier_families[0]
     return {
         "drug_name": str(values.get("drug_name") or values.get("ndc") or "").strip(),
         "rxcui": str(values.get("rxcui") or "").strip(),
         "ndc": str(values.get("ndc") or "").strip(),
-        "tier_family": str(tier_family or values.get("tier_family") or "brand").strip().lower() or None,
+        "tier_family": requested_tier_family or None,
         "day_supply": selected_day_supply,
         "quantity_override": None,
         "fills_per_year_override": None,
@@ -240,6 +307,90 @@ def _stringify_list(values: object) -> str:
     if pd.isna(values):
         return ""
     return str(values)
+
+
+def _channel_label(channel: str) -> str:
+    return CHANNEL_LABELS.get(str(channel), str(channel).replace("_", " "))
+
+
+def summarize_drug_channel_path(breakdown: PlanDrugBreakdown) -> str:
+    if not breakdown.fill_traces:
+        if breakdown.pricing_status != "priced":
+            return f"No priced fills were simulated ({breakdown.pricing_status.replace('_', ' ')})."
+        return "No fill-level timeline is available."
+
+    ordered_traces = sorted(
+        breakdown.fill_traces,
+        key=lambda item: (item.sequence_index, item.day_offset, item.fill_number),
+    )
+    condensed_channels: list[str] = []
+    for trace in ordered_traces:
+        channel = str(trace.selected_channel)
+        if not condensed_channels or condensed_channels[-1] != channel:
+            condensed_channels.append(channel)
+
+    switch_count = max(0, len(condensed_channels) - 1)
+    if switch_count == 0:
+        return (
+            f"Stable {_channel_label(condensed_channels[0])} path across "
+            f"{len(ordered_traces)} fill(s)."
+        )
+    return (
+        f"Switches {switch_count} time(s): "
+        + " -> ".join(_channel_label(channel) for channel in condensed_channels)
+    )
+
+
+def build_monthly_timeline_frame(recommendation: PlanRecommendation) -> pd.DataFrame:
+    monthly_premium = float(recommendation.annual_premium) / 12.0
+    month_rows = [
+        {
+            "Month": MONTH_LABELS[month_index - 1],
+            "Month number": month_index,
+            "Drug OOP": 0.0,
+            "Deductible applied": 0.0,
+            "Monthly premium": monthly_premium,
+            "Projected monthly total": monthly_premium,
+            "Cumulative drug OOP": 0.0,
+            "Cumulative total": 0.0,
+            "Fill count": 0,
+            "Filled drugs": [],
+        }
+        for month_index in range(1, 13)
+    ]
+
+    for breakdown in recommendation.drug_breakdowns:
+        for trace in breakdown.fill_traces:
+            month_index = max(1, min(12, int(trace.day_offset // 30) + 1))
+            row = month_rows[month_index - 1]
+            row["Drug OOP"] += float(trace.final_oop)
+            row["Deductible applied"] += float(trace.deductible_applied)
+            row["Projected monthly total"] += float(trace.final_oop)
+            row["Fill count"] += 1
+            if breakdown.drug_name not in row["Filled drugs"]:
+                row["Filled drugs"].append(str(breakdown.drug_name))
+
+    cumulative_drug_oop = 0.0
+    cumulative_total = 0.0
+    normalized_rows: list[dict[str, object]] = []
+    for row in month_rows:
+        cumulative_drug_oop += float(row["Drug OOP"])
+        cumulative_total += float(row["Projected monthly total"])
+        normalized_rows.append(
+            {
+                "Month": row["Month"],
+                "Month number": int(row["Month number"]),
+                "Drug OOP": round(float(row["Drug OOP"]), 2),
+                "Deductible applied": round(float(row["Deductible applied"]), 2),
+                "Monthly premium": round(float(row["Monthly premium"]), 2),
+                "Projected monthly total": round(float(row["Projected monthly total"]), 2),
+                "Cumulative drug OOP": round(cumulative_drug_oop, 2),
+                "Cumulative total": round(cumulative_total, 2),
+                "Fill count": int(row["Fill count"]),
+                "Filled drugs": ", ".join(row["Filled drugs"]),
+            }
+        )
+    return pd.DataFrame(normalized_rows)
 
 
 def build_side_by_side_frame(
@@ -266,6 +417,10 @@ def build_side_by_side_frame(
         ("Estimated annual OOP", "estimated_annual_oop"),
         ("Coverage percent", "coverage_pct_requested"),
         ("Coverage status", "coverage_status"),
+        ("Priced medications", "priced_drug_count"),
+        ("Channel switches", "channel_switch_count"),
+        ("Channel mix", "selected_channel_mix"),
+        ("Simulation policy", "simulation_policy"),
         ("Confidence", "confidence_band"),
         ("Decision score", "decision_score"),
         ("Rules score", "rules_score"),
@@ -290,6 +445,8 @@ def build_side_by_side_frame(
                 metric_row[plan_name] = f"{float(value):.1f}"
             elif column == "rules_score" and value is not None:
                 metric_row[plan_name] = f"{float(value):.2f}"
+            elif column in {"priced_drug_count", "channel_switch_count"} and value is not None:
+                metric_row[plan_name] = f"{int(value)}"
             elif column == "nearest_preferred_distance_miles":
                 metric_row[plan_name] = (
                     "n/a" if value is None or pd.isna(value) else f"{float(value):.1f} miles"
@@ -341,6 +498,22 @@ def build_counselor_note(
             f"It is about ${delta:,.0f} lower than the next eligible option in this run."
         )
 
+    priced_drug_count = top.get("priced_drug_count")
+    if priced_drug_count is not None and not pd.isna(priced_drug_count):
+        note_parts.append(
+            f"{int(priced_drug_count)} entered medication(s) were fully priceable in the simulated path."
+        )
+
+    channel_switch_count = top.get("channel_switch_count")
+    if channel_switch_count is not None and not pd.isna(channel_switch_count):
+        channel_switch_count = int(channel_switch_count)
+        if channel_switch_count > 0:
+            note_parts.append(
+                f"The projected yearly fill path switches pharmacy channels {channel_switch_count} time(s)."
+            )
+        else:
+            note_parts.append("The projected yearly fill path stays on a stable pharmacy channel pattern.")
+
     warning_flags = top.get("warning_flags") or []
     if isinstance(warning_flags, list) and warning_flags:
         note_parts.append(f"Key watchouts: {'; '.join(str(item) for item in warning_flags[:3])}.")
@@ -367,11 +540,15 @@ __all__ = [
     "append_medication_row",
     "build_medication_row_from_catalog",
     "build_counselor_note",
+    "build_monthly_timeline_frame",
     "build_side_by_side_frame",
+    "catalog_available_day_supply_options",
+    "catalog_tier_family_options",
     "coerce_zipcode",
     "format_drug_catalog_option",
     "haversine_miles",
     "parse_medication_frame",
     "search_drug_catalog",
+    "summarize_drug_channel_path",
     "summarize_evidence_gaps",
 ]
