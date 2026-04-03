@@ -337,4 +337,4 @@ def test_monthly_variance_features_capture_priceability_and_timing():
 
     assert features["priced_drug_share"] == 0.5
     assert features["monthly_drug_oop_variance"] > 0.0
-    assert features["monthly_total_variance"] == features["monthly_drug_oop_variance"]
+    assert abs(features["monthly_total_variance"] - features["monthly_drug_oop_variance"]) < 1e-9

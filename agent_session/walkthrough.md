@@ -1,38 +1,35 @@
-# Counselor Timeline Walkthrough
+# Reranker Feature Expansion Walkthrough
 
 ## Summary
-The recommendation engine already knew the yearly sequence of fills after the cost-realism sprint. This follow-on work turns that trace data into counselor-facing views so users can see not only which plan ranks highest, but when cost pressure happens and whether the pharmacy-channel path is stable.
+The hybrid reranker already consumed rules-engine outputs, but it still lacked two important signals introduced by recent sprints:
+- how much of the entered regimen was actually priceable
+- how uneven cost pressure was across the year
 
-## New Timeline Helpers
-- `build_monthly_timeline_frame(recommendation)` buckets audited fill traces into a 12-month relative plan-year view.
-- Each month now shows:
-  - drug OOP
-  - deductible applied
-  - monthly premium
-  - projected monthly total
-  - cumulative drug OOP
-  - cumulative total
-  - fill count
-  - filled drugs
-- `summarize_drug_channel_path(breakdown)` turns raw channel traces into readable medication-level explanations such as a stable preferred-retail path or a switching retail-to-mail path.
+This phase closes that gap by pushing both priceability share and monthly cost-variance features into the training and inference feature frames.
 
-## Streamlit Surface
-- Plan detail expanders now show two charts:
-  - monthly cash-flow bars
-  - cumulative OOP / total-cost timeline lines
-- The drug-by-drug table now includes a `Channel path` column built from each medication's fill trace sequence.
-- The side-by-side comparison table now carries the operational metadata that became important after the cost-realism sprint:
-  - priced medications
-  - channel switches
-  - channel mix
-  - simulation policy
+## New Features
+- `priced_drug_share`
+  - beneficiary-facing meaning: how much of the requested medication list produced usable simulated pricing
+  - modeling value: separates partial-but-usable plans from weak fallback plans more clearly than counts alone
+- `monthly_drug_oop_variance`
+  - measures how uneven drug cost-sharing is across the simulated year
+- `monthly_total_variance`
+  - measures how uneven combined premium-plus-drug cost pressure is across the simulated year
+
+## How They Are Derived
+- `priced_drug_share` is computed from `priced_drug_count / requested_drug_count`.
+- Monthly variance features are derived from the same fill traces used by the counselor timeline view:
+  - fills are bucketed into 12 relative plan-year months
+  - monthly drug OOP totals are aggregated
+  - monthly total cost adds the monthly premium to those buckets
+  - variance is computed across the 12-month vectors
 
 ## Why This Matters
-- Counselors can now distinguish a low annual total from a plan that creates an early deductible spike.
-- Channel stability is visible without reading raw fill traces or explanation groups.
-- The UI now better reflects the rules engine's actual logic instead of flattening everything into one annual number.
+- The reranker can now distinguish a plan that looks acceptable annually but produces a spiky early-year burden.
+- Priceability is represented as a normalized share rather than only a raw count, which improves comparability across medication-list sizes.
+- The research dataset and production inference frame now stay better aligned with what counselors actually see in the UI.
 
 ## Remaining Next Steps
-- Decide whether monthly timelines should become downloadable structured outputs.
-- Consider adding monthly-variance features to model training.
-- Add scenario toggles for channel-stability vs lowest-single-fill-cost preferences.
+- Build beneficiary what-if scenario tooling.
+- Add UI toggles for stable-channel preference vs lowest projected single-fill OOP.
+- Decide whether monthly timeline rows should become downloadable public outputs.
