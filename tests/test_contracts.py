@@ -165,6 +165,8 @@ def _sample_recommendation(
         annual_oop=annual_drug_oop,
         deductible_exposure=0.0,
         initial_coverage_oop=annual_drug_oop,
+        coverage_gap_oop=0.0,
+        catastrophic_oop=0.0,
         lis_adjusted_oop=annual_drug_oop,
         negotiated_price_total=120.0,
         oop_cap_savings=0.0,
