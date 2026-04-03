@@ -16,7 +16,7 @@ from .config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
-DATASET_SCHEMA_VERSION = "request_features_v2"
+DATASET_SCHEMA_VERSION = "request_features_v3"
 WEAK_LABEL_VERSION = "weak_label_v2"
 TREE_MODEL_TYPE = "tree"
 LINEAR_MODEL_TYPE = "linear"
@@ -49,6 +49,7 @@ MODEL_NUMERIC_COLUMNS = [
     "covered_drug_share",
     "uncovered_drug_count",
     "uncovered_drug_share",
+    "priced_drug_count",
     "restriction_count",
     "deductible_exposure_total",
     "initial_coverage_oop_total",
@@ -63,6 +64,7 @@ MODEL_NUMERIC_COLUMNS = [
     "channel_unavailable_share",
     "mail_order_dependency_flag",
     "mail_order_dependency_share",
+    "channel_switch_count",
     "insulin_risk_flag",
     "insulin_nonpreferred_dependency_count",
     "insulin_nonpreferred_dependency_share",
@@ -725,6 +727,7 @@ def _recommendations_to_feature_rows(
             "covered_drug_share": float(covered_drug_count_request / requested_drug_count),
             "uncovered_drug_count": float(recommendation.uncovered_drug_count),
             "uncovered_drug_share": float(recommendation.uncovered_drug_count / requested_drug_count),
+            "priced_drug_count": float(recommendation.priced_drug_count),
             "restriction_count": float(recommendation.restriction_count),
             "deductible_exposure_total": float(deductible_exposure_total),
             "initial_coverage_oop_total": float(initial_coverage_oop_total),
@@ -739,6 +742,7 @@ def _recommendations_to_feature_rows(
             "channel_unavailable_share": float(channel_unavailable_count / requested_drug_count),
             "mail_order_dependency_flag": float(1 if mail_order_count > 0 else 0),
             "mail_order_dependency_share": float(mail_order_count / requested_drug_count),
+            "channel_switch_count": float(recommendation.channel_switch_count),
             "insulin_risk_flag": float(1 if recommendation.insulin_flag else 0),
             "insulin_nonpreferred_dependency_count": float(insulin_nonpreferred_dependency_count),
             "insulin_nonpreferred_dependency_share": float(insulin_nonpreferred_dependency_count / requested_drug_count),
@@ -767,6 +771,7 @@ def _recommendations_to_feature_rows(
             "served_counties": float(feature_row.get("served_counties") or 0.0),
             "contract_year": float(recommendation.contract_year or 0.0),
             "benefit_design": recommendation.benefit_design,
+            "simulation_policy": recommendation.simulation_policy,
             "feature_version": recommendation.feature_version,
         }
         rows.append(row)
@@ -1345,6 +1350,15 @@ def _confidence_bucket(scores: list[float]) -> list[str]:
     return buckets
 
 
+def _hybrid_bucket_index(recommendation: Any) -> int:
+    requested_drug_count = max(1, len(recommendation.drug_breakdowns))
+    if recommendation.coverage_status == "full" and recommendation.priced_drug_count >= requested_drug_count:
+        return 0
+    if recommendation.priced_drug_count > 0:
+        return 1
+    return 2
+
+
 def apply_hybrid_reranking(
     recommendations: list[Any],
     beneficiary: Any,
@@ -1369,19 +1383,20 @@ def apply_hybrid_reranking(
         for plan_key, score in zip(frame["plan_key"].tolist(), artifact.predict(frame), strict=False)
     }
 
-    grouped: dict[str, list[Any]] = {"full": [], "partial": []}
+    grouped: dict[int, list[Any]] = {0: [], 1: [], 2: []}
     for recommendation in recommendations:
         recommendation.model_score = score_lookup.get(recommendation.plan_key)
         recommendation.ranking_source = "hybrid_reranker"
         recommendation.feature_version = artifact.feature_version
-        grouped["full" if recommendation.coverage_status == "full" else "partial"].append(recommendation)
+        grouped[_hybrid_bucket_index(recommendation)].append(recommendation)
 
     reranked: list[Any] = []
-    for coverage_group in ("full", "partial"):
+    for bucket_index in (0, 1, 2):
         ordered = sorted(
-            grouped[coverage_group],
+            grouped[bucket_index],
             key=lambda item: (
                 -(item.model_score if item.model_score is not None else float("-inf")),
+                -float(item.priced_drug_count),
                 -float(item.rules_score),
                 item.annual_total_cost,
                 item.uncovered_drug_count,

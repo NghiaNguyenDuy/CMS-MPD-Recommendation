@@ -52,6 +52,7 @@ def _sample_recommendation(
     fill_trace = DrugFillTrace(
         fill_number=1,
         day_offset=0,
+        sequence_index=1,
         selected_channel="pref_retail",
         coverage_phase="initial_coverage",
         pricing_status="priced",
@@ -176,12 +177,12 @@ def _sample_recommendation(
         insulin_flag=True,
         coverage_gap_flag=False,
         coverage_status="covered" if uncovered_drug_count == 0 else "excluded",
-        pricing_status="priced",
-        coverage_phases=["initial_coverage"],
+        pricing_status="priced" if uncovered_drug_count == 0 else "excluded",
+        coverage_phases=["initial_coverage"] if uncovered_drug_count == 0 else [],
         match_source="exact_name",
         match_confidence="exact",
-        explanations=["Insulin glargine priced successfully."],
-        fill_traces=[fill_trace],
+        explanations=["Insulin glargine priced successfully."] if uncovered_drug_count == 0 else ["Insulin glargine is excluded from coverage."],
+        fill_traces=[fill_trace] if uncovered_drug_count == 0 else [],
     )
     return PlanRecommendation(
         plan_key=plan_key,
@@ -231,10 +232,13 @@ def _sample_recommendation(
         nearest_preferred_distance_miles=nearest_distance_miles,
         service_area_eligible=not comparison_only,
         comparison_only=comparison_only,
-        feature_version="research_v3",
+        feature_version="research_v4",
         drug_breakdowns=[drug_breakdown],
         contract_year=2025,
         benefit_design="2025_redesign",
+        priced_drug_count=1 if uncovered_drug_count == 0 else 0,
+        channel_switch_count=0,
+        simulation_policy="cost_realism_v1",
     )
 
 
@@ -396,6 +400,9 @@ def test_decision_support_exports_and_counselor_note():
     assert bool(comparison_frame.iloc[0]["comparison_only"]) is True
     assert eligible_frame.iloc[0]["contract_year"] == 2025
     assert eligible_frame.iloc[0]["benefit_design"] == "2025_redesign"
+    assert eligible_frame.iloc[0]["priced_drug_count"] == 1
+    assert eligible_frame.iloc[0]["channel_switch_count"] == 0
+    assert eligible_frame.iloc[0]["simulation_policy"] == "cost_realism_v1"
 
     side_by_side = build_side_by_side_frame(combined, selected_plan_keys=["P1", "P3"])
     assert list(side_by_side.columns) == ["Metric", "Alpha Choice", "Gamma Nearby"]
@@ -406,6 +413,7 @@ def test_decision_support_exports_and_counselor_note():
     assert feature_coverage["comparison_only_plans"] == 1
     assert feature_coverage["contract_years"] == [2025]
     assert feature_coverage["benefit_designs"] == ["2025_redesign"]
+    assert feature_coverage["simulation_policies"] == ["cost_realism_v1"]
 
     profile = ProfileInput(
         persona="Counselor",
@@ -449,7 +457,17 @@ def test_decision_support_exports_and_counselor_note():
     assert audit.run_id == "run123"
     assert audit.data_snapshot == "2025-Q3"
     assert len(audit.top_k_outputs) == 3
-    assert {"PLAN_KEY", "PLAN_NAME", "eligibility_status", "contract_year", "benefit_design"}.issubset(audit.top_k_outputs[0])
+    assert {
+        "PLAN_KEY",
+        "PLAN_NAME",
+        "eligibility_status",
+        "contract_year",
+        "benefit_design",
+        "priced_drug_count",
+        "channel_switch_count",
+        "simulation_policy",
+        "selected_channel_mix",
+    }.issubset(audit.top_k_outputs[0])
     assert "Alpha Choice" in note
     assert "comparison-only" in note
     assert any("Hybrid reranker score not available" in gap for gap in gaps)

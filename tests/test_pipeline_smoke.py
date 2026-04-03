@@ -225,19 +225,30 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert recommendations[0].fit_label
     assert recommendations[0].fit_summary
     assert recommendations[0].monthly_cost_estimate == round(recommendations[0].annual_total_cost / 12, 2)
-    assert recommendations[0].feature_version
+    assert recommendations[0].feature_version == "research_v4"
     assert recommendations[0].contract_year == 2025
     assert recommendations[0].benefit_design == "2025_redesign"
+    assert recommendations[0].priced_drug_count == 2
+    assert recommendations[0].channel_switch_count == 0
+    assert recommendations[0].simulation_policy == "cost_realism_v1"
+    assert recommendations[1].priced_drug_count == 1
     assert recommendations[0].resolved_medications[0].match_source == "exact_name"
     assert recommendations[0].drug_breakdowns[0].coverage_status == "covered"
     assert recommendations[0].drug_breakdowns[0].medication_id
     assert recommendations[0].drug_breakdowns[0].pricing_status == "priced"
     assert recommendations[0].drug_breakdowns[0].fill_traces
     assert recommendations[0].drug_breakdowns[0].fill_traces[0].coverage_phase
+    assert recommendations[0].drug_breakdowns[0].fill_traces[0].sequence_index >= 1
+    assert recommendations[0].drug_breakdowns[1].fill_traces[0].sequence_index < recommendations[0].drug_breakdowns[0].fill_traces[0].sequence_index
     assert recommendations[0].drug_breakdowns[0].fill_traces[0].benefit_design == "2025_redesign"
     assert recommendations[0].drug_breakdowns[0].coverage_gap_flag is False
     assert recommendations[1].drug_breakdowns[1].coverage_status == "excluded"
     assert recommendations[1].explanation_groups.coverage_issues
+
+    reversed_recommendations = recommend_plans(beneficiary, list(reversed(medications)), config=config)
+    assert [item.plan_key for item in reversed_recommendations] == [item.plan_key for item in recommendations]
+    assert [item.annual_total_cost for item in reversed_recommendations] == [item.annual_total_cost for item in recommendations]
+    assert [item.priced_drug_count for item in reversed_recommendations] == [item.priced_drug_count for item in recommendations]
 
     duplicate_medications = [
         MedicationInput(drug_name="insulin glargine", tier_family="brand", day_supply=30),

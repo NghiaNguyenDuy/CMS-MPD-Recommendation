@@ -39,6 +39,9 @@ RECOMMENDATION_SCHEMA_COLUMNS = [
     "feature_version",
     "contract_year",
     "benefit_design",
+    "priced_drug_count",
+    "channel_switch_count",
+    "simulation_policy",
 ]
 
 CONFIDENCE_SCORE_MAP = {
@@ -150,6 +153,7 @@ def _access_summary(recommendation: PlanRecommendation, comparison_only: bool) -
         "nearest_preferred_miles": recommendation.nearest_preferred_distance_miles,
         "mail_order_dependency_count": recommendation.mail_order_dependency_count,
         "channel_diversity_count": recommendation.channel_diversity_count,
+        "channel_switch_count": recommendation.channel_switch_count,
         "channel_mix": recommendation.best_channel_mix,
     }
 
@@ -180,6 +184,11 @@ def _evidence_gaps(recommendation: PlanRecommendation, comparison_only: bool) ->
         gaps.append(f"{approximate_matches} medication match(es) are approximate.")
     if recommendation.model_score is None:
         gaps.append("Hybrid reranker score not available for this result.")
+    requested_count = max(1, len(recommendation.drug_breakdowns))
+    if recommendation.priced_drug_count < requested_count:
+        gaps.append(
+            f"Only {recommendation.priced_drug_count} of {requested_count} entered medication(s) were fully priceable."
+        )
     if recommendation.nearest_preferred_distance_miles is None:
         gaps.append("Nearest preferred pharmacy distance is not available.")
     if comparison_only:
@@ -224,7 +233,7 @@ def compute_heuristic_score(recommendation: PlanRecommendation) -> float:
     penalty += 20.0 * recommendation.uncovered_drug_count
     penalty += 8.0 * recommendation.restriction_count
     penalty += 6.0 * recommendation.mail_order_dependency_count
-    penalty += 5.0 * recommendation.channel_diversity_count
+    penalty += 8.0 * recommendation.channel_switch_count
     penalty += 15.0 if recommendation.network_flag == "no_preferred_retail" else 0.0
     penalty += 6.0 if recommendation.network_flag == "limited_preferred_retail" else 0.0
     if recommendation.nearest_preferred_distance_miles is not None:
@@ -289,6 +298,9 @@ def recommendations_to_dataframe(
             "feature_version": recommendation.feature_version,
             "contract_year": recommendation.contract_year,
             "benefit_design": recommendation.benefit_design,
+            "priced_drug_count": recommendation.priced_drug_count,
+            "channel_switch_count": recommendation.channel_switch_count,
+            "simulation_policy": recommendation.simulation_policy,
             "selected_channel_mix": recommendation.best_channel_mix,
             "network_flag": recommendation.network_flag,
             "nearest_preferred_distance_miles": recommendation.nearest_preferred_distance_miles,
@@ -315,6 +327,7 @@ def summarize_feature_coverage(
         "plans_with_full_coverage": sum(1 for item in eligible_recommendations if item.coverage_status == "full"),
         "contract_years": sorted({int(item.contract_year) for item in all_recommendations if item.contract_year is not None}),
         "benefit_designs": sorted({str(item.benefit_design) for item in all_recommendations if item.benefit_design}),
+        "simulation_policies": sorted({str(item.simulation_policy) for item in all_recommendations if item.simulation_policy}),
     }
 
 
@@ -357,6 +370,10 @@ def create_run_audit(
             "stability_score",
             "contract_year",
             "benefit_design",
+            "priced_drug_count",
+            "channel_switch_count",
+            "simulation_policy",
+            "selected_channel_mix",
         ]
         top_k = serialize_nested_columns(recommendations[export_cols].head(10)).to_dict("records")
     return RecommendationAudit(

@@ -1,26 +1,52 @@
-# Correctness-First Benefit Design Walkthrough
+# Cost-Realistic Recommendation Flow Walkthrough
 
 ## Summary
-The old walkthrough was directionally useful but no longer represented the intended runtime behavior. `2025-Q3` data now runs through the 2025 Part D redesign by default, while historical coverage-gap behavior is available only through explicit `2024_standard` handling.
+The recommendation engine now uses a more realistic annual ledger instead of relying on simple chronological fill ordering and per-fill greedy channel picks. The goal is not to mimic every operational detail of Part D claims, but to produce rankings that are stable, auditable, and easier for counselors to trust.
 
-## Active Benefit Designs
-- `2025_redesign`: deductible -> initial coverage -> annual OOP cap -> $0 thereafter.
-- `2024_standard`: deductible -> initial coverage -> coverage gap -> catastrophic, with catastrophic beneficiary liability modeled as $0.
-- `auto`: choose between those paths using `contract_year`, falling back to the snapshot year when the source year is missing.
+## Annual Simulation Flow
+1. Each covered medication is expanded into `ScheduledFillEvent` records with:
+   - medication id
+   - fill number
+   - day offset
+   - deductible applicability
+   - negotiated-price proxy
+   - feasible channels
+2. Events are sorted deterministically by:
+   - day offset
+   - deductible applicability
+   - negotiated-price proxy descending
+   - medication id
+   - fill number
+3. The engine simulates each event against the active benefit design (`2025_redesign` or `2024_standard`) and records a `DrugFillTrace` with a global `sequence_index`.
 
-## Engine Changes
-- `PipelineConfig` and CLI now expose `benefit_design_mode`.
-- `CONTRACT_YEAR` is carried from formulary input into the gold serving layer and recommendation outputs.
-- `_simulate_fill_cost()` dispatches into explicit 2025 and 2024 paths instead of mixing phase logic in one flow.
-- 2024 threshold crossings now split fills into segments so straddle fills are not double-charged.
-- `coverage_gap_flag` now means the simulation actually entered the coverage gap.
-- Recommendation exports and audits now include both `contract_year` and `benefit_design`.
-- Hybrid reranker evaluation now trains on scenario-level train splits and reports metrics on held-out scenarios only.
+## Channel Selection Flow
+- Every feasible channel is still priced for the fill.
+- The chosen channel now follows a stable policy:
+  - lowest projected OOP first
+  - keep the previous medication channel when within the `$1.00` tolerance
+  - prefer preferred-network channels
+  - then honor retail-vs-mail preference
+- Medication-level channel switches are counted and surfaced as `channel_switch_count` in recommendation outputs.
+
+## Recommendation Ranking Flow
+- Plans are no longer sorted only by full-vs-partial coverage and fit score.
+- The rules engine now buckets plans into:
+  - fully covered and fully priceable
+  - eligible but needs verification
+  - fallback only
+- `priced_drug_count` helps separate plans that produced real pricing evidence from plans that only remain as weak comparisons.
+- Hybrid reranking, when enabled, preserves those bucket boundaries and reranks only within them.
+
+## Audit Surface
+- `DrugFillTrace.sequence_index` makes deductible and OOP transitions auditable.
+- `PlanRecommendation` now exposes:
+  - `priced_drug_count`
+  - `channel_switch_count`
+  - `simulation_policy`
+  - `contract_year`
+  - `benefit_design`
+- Dataframe exports and run-audit payloads now carry the same fields so counselor-facing analysis can trace how a recommendation was formed.
 
 ## Validation Snapshot
-- Focused regression suite covers 2025-default behavior, explicit 2024 transitions, export contracts, and held-out evaluation metadata.
-- The full project should continue to use rules-first cost simulation as the source of truth, with ML limited to reranking simulated plan rows.
-
-## Follow-On Work
-- Deductible sequencing and what-if scenario UX can continue from this corrected baseline.
-- Any future historical modeling should remain opt-in and auditable through `benefit_design` output fields.
+- Focused tests cover deterministic sequencing, deductible-first ordering on same-day fills, near-tie channel continuity, and bucket-aware ranking.
+- Smoke coverage confirms recommendation output is stable even when medication input order is reversed.

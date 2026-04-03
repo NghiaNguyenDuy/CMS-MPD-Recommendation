@@ -31,7 +31,10 @@ NETWORK_PRIORITY = {
     "limited_preferred_retail": 1,
     "no_preferred_retail": 2,
 }
-FEATURE_VERSION = "research_v3"
+FEATURE_VERSION = "research_v4"
+SIMULATION_POLICY = "cost_realism_v1"
+CHANNEL_NEAR_TIE_TOLERANCE = 1.0
+CHANNEL_ORDER = ("pref_retail", "nonpref_retail", "pref_mail", "nonpref_mail")
 FOCUS_WEIGHTS = {
     "balanced": {
         "cost": 0.28,
@@ -192,6 +195,7 @@ class PlanExplanationDetailGroups:
 class DrugFillTrace:
     fill_number: int
     day_offset: int
+    sequence_index: int
     selected_channel: str
     coverage_phase: str
     pricing_status: str
@@ -236,6 +240,18 @@ class FillCostResult:
     troop_before: float = 0.0
     troop_after: float = 0.0
     benefit_design: str = BENEFIT_DESIGN_2025
+
+
+@dataclass(slots=True)
+class ScheduledFillEvent:
+    medication_id: str
+    fill_number: int
+    day_offset: int
+    deductible_applicable: bool
+    negotiated_price_proxy: float
+    available_channels: tuple[str, ...]
+    medication: dict[str, Any]
+    basis: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -320,6 +336,9 @@ class PlanRecommendation:
     drug_breakdowns: list[PlanDrugBreakdown]
     contract_year: int | None = None
     benefit_design: str = BENEFIT_DESIGN_2025
+    priced_drug_count: int = 0
+    channel_switch_count: int = 0
+    simulation_policy: str = SIMULATION_POLICY
 
 
 def _normalize_days_supply(day_supply: int) -> int:
@@ -560,8 +579,8 @@ def _build_strengths(
 
     if recommendation.restriction_count == 0:
         _append_unique(strengths, "No major utilization-management restrictions were flagged.")
-    if recommendation.channel_diversity_count <= 1 and recommendation.mail_order_dependency_count == 0:
-        _append_unique(strengths, "The projected fill path is simple and does not depend on mail order.")
+    if recommendation.channel_switch_count == 0 and recommendation.mail_order_dependency_count == 0:
+        _append_unique(strengths, "The projected fill path is stable and does not depend on mail order.")
     if recommendation.coverage_status == "full":
         _append_unique(strengths, "All entered medications were priced within the simulated benefit design.")
     return strengths[:3]
@@ -593,8 +612,11 @@ def _build_watchouts(
             watchouts,
             f"Nearest preferred retail pharmacy is about {recommendation.nearest_preferred_distance_miles:.1f} miles away.",
         )
-    if recommendation.channel_diversity_count > 1:
-        _append_unique(watchouts, "The projected lowest-cost path mixes more than one pharmacy channel.")
+    if recommendation.channel_switch_count > 0:
+        _append_unique(
+            watchouts,
+            f"The projected yearly fill path switches pharmacy channels {recommendation.channel_switch_count} time(s).",
+        )
     if approximate_match_count > 0:
         _append_unique(watchouts, "At least one medication match is approximate and should be reviewed.")
     return watchouts[:3]
@@ -878,6 +900,129 @@ def _channel_available(channel_summary: dict[str, Any], channel: str, pharmacy_p
         "nonpref_mail": "has_nonpref_mail",
     }
     return bool(channel_summary.get(availability_map[channel], False))
+
+
+def _preferred_channel_rank(channel: str) -> int:
+    return 0 if channel in {"pref_retail", "pref_mail"} else 1
+
+
+def _channel_family_rank(channel: str, pharmacy_preference: str) -> int:
+    if pharmacy_preference == "retail":
+        return 0 if "retail" in channel else 1
+    if pharmacy_preference == "mail":
+        return 0 if "mail" in channel else 1
+    return 0
+
+
+def _available_channels(channel_summary: dict[str, Any], pharmacy_preference: str) -> tuple[str, ...]:
+    return tuple(
+        channel
+        for channel in CHANNEL_ORDER
+        if _channel_available(channel_summary, channel, pharmacy_preference)
+    )
+
+
+def _estimate_channel_negotiated_price(
+    basis: dict[str, Any],
+    channel_summary: dict[str, Any],
+    channel: str,
+    quantity: float,
+) -> float | None:
+    unit_cost = basis.get("unit_cost")
+    if unit_cost is None or pd.isna(unit_cost):
+        return None
+    fee = _select_fee(channel_summary, channel, str(basis["tier_family"]), int(basis["days_supply"]))
+    if fee is None:
+        return None
+    return max(float(unit_cost) * float(quantity) + fee, _select_floor(channel_summary, channel))
+
+
+def _estimate_negotiated_price_proxy(
+    basis: dict[str, Any],
+    channel_summary: dict[str, Any],
+    quantity: float,
+    available_channels: tuple[str, ...],
+) -> float:
+    estimates = [
+        estimate
+        for channel in available_channels
+        if (estimate := _estimate_channel_negotiated_price(basis, channel_summary, channel, quantity)) is not None
+    ]
+    if not estimates:
+        return 0.0
+    return min(estimates)
+
+
+def _build_scheduled_fill_events(
+    medication: dict[str, Any],
+    basis: dict[str, Any],
+    channel_summary: dict[str, Any],
+    pharmacy_preference: str,
+) -> list[ScheduledFillEvent]:
+    available_channels = _available_channels(channel_summary, pharmacy_preference)
+    negotiated_price_proxy = _estimate_negotiated_price_proxy(
+        basis,
+        channel_summary,
+        float(medication["quantity"]),
+        available_channels,
+    )
+    fills_per_year = max(1, int(medication["fills_per_year"]))
+    interval = 365.0 / fills_per_year
+    deductible_applicable = bool(basis.get("deductible_applies"))
+    return [
+        ScheduledFillEvent(
+            medication_id=str(medication["medication_id"]),
+            fill_number=fill_index + 1,
+            day_offset=int(round(fill_index * interval)),
+            deductible_applicable=deductible_applicable,
+            negotiated_price_proxy=negotiated_price_proxy,
+            available_channels=available_channels,
+            medication=medication,
+            basis=basis,
+        )
+        for fill_index in range(fills_per_year)
+    ]
+
+
+def _scheduled_fill_sort_key(event: ScheduledFillEvent) -> tuple[Any, ...]:
+    return (
+        event.day_offset,
+        0 if event.deductible_applicable else 1,
+        -event.negotiated_price_proxy,
+        event.medication_id,
+        event.fill_number,
+    )
+
+
+def _select_best_channel_result(
+    channel_results: list[tuple[str, FillCostResult]],
+    previous_channel: str | None,
+    pharmacy_preference: str,
+) -> tuple[str | None, FillCostResult | None]:
+    if not channel_results:
+        return None, None
+
+    lowest_oop = min(result.total_oop for _, result in channel_results)
+    near_ties = [
+        (channel, result)
+        for channel, result in channel_results
+        if result.total_oop <= lowest_oop + CHANNEL_NEAR_TIE_TOLERANCE + 1e-9
+    ]
+    if previous_channel:
+        for channel, result in near_ties:
+            if channel == previous_channel:
+                return channel, result
+
+    ordered = sorted(
+        near_ties,
+        key=lambda item: (
+            _preferred_channel_rank(item[0]),
+            _channel_family_rank(item[0], pharmacy_preference),
+            item[1].total_oop,
+            item[0],
+        ),
+    )
+    return ordered[0]
 
 
 def _apply_lis_adjustment(amount: float, tier_family: str, lis_status: str) -> float:
@@ -1298,6 +1443,28 @@ def _compute_rules_score(
     )
 
 
+def _recommendation_bucket_index(recommendation: PlanRecommendation) -> int:
+    requested_drug_count = max(1, len(recommendation.drug_breakdowns))
+    if recommendation.coverage_status == "full" and recommendation.priced_drug_count >= requested_drug_count:
+        return 0
+    if recommendation.priced_drug_count > 0:
+        return 1
+    return 2
+
+
+def _rules_ranking_sort_key(recommendation: PlanRecommendation) -> tuple[Any, ...]:
+    return (
+        _recommendation_bucket_index(recommendation),
+        -int(recommendation.priced_drug_count),
+        -float(recommendation.fit_score),
+        float(recommendation.annual_total_cost),
+        int(recommendation.uncovered_drug_count),
+        int(recommendation.restriction_count),
+        NETWORK_PRIORITY.get(recommendation.network_flag, 99),
+        recommendation.plan_name,
+    )
+
+
 def _apply_fit_scoring(
     recommendations: list[PlanRecommendation],
     beneficiary: BeneficiaryInput,
@@ -1331,6 +1498,7 @@ def _apply_fit_scoring(
         channel_diversity_count = len(
             {item.selected_channel for item in breakdowns if item.selected_channel != "unavailable"}
         )
+        channel_switch_count = int(recommendation.channel_switch_count)
         deductible_exposure_total = sum(float(item.deductible_exposure) for item in breakdowns)
 
         coverage_score = _clamp(
@@ -1344,7 +1512,7 @@ def _apply_fit_scoring(
         access_score = _clamp(
             NETWORK_ACCESS_BASE.get(recommendation.network_flag, 60.0)
             - _distance_penalty(recommendation.nearest_preferred_distance_miles)
-            - 10.0 * max(channel_diversity_count - 1, 0)
+            - 6.0 * channel_switch_count
             - 6.0 * max(mail_order_dependency_count - 1, 0)
             - _preferred_channel_penalty(
                 beneficiary.pharmacy_preference,
@@ -1356,7 +1524,7 @@ def _apply_fit_scoring(
         stability_score = _clamp(
             100.0
             - 9.0 * recommendation.restriction_count
-            - 8.0 * max(channel_diversity_count - 1, 0)
+            - 8.0 * channel_switch_count
             - _deductible_pressure_penalty(
                 deductible_exposure_total,
                 max(recommendation.annual_total_cost, recommendation.annual_drug_oop, 1.0),
@@ -1527,7 +1695,7 @@ def recommend_plans(
         detail_groups = PlanExplanationDetailGroups([], [], [], [], [], [])
         drug_state: dict[str, dict[str, Any]] = {}
 
-        fill_events: list[tuple[float, int, dict[str, Any], dict[str, Any]]] = []
+        fill_events: list[ScheduledFillEvent] = []
         for medication in resolved_medications:
             medication_id = str(medication["medication_id"])
             drug_name = str(medication["drug_name"])
@@ -1550,6 +1718,8 @@ def recommend_plans(
                 "coverage_phases": set(),
                 "fill_traces": [],
                 "explanations": [],
+                "channel_switch_count": 0,
+                "last_selected_channel": None,
             }
             if basis is None:
                 state["coverage_status"] = "uncovered"
@@ -1591,21 +1761,27 @@ def recommend_plans(
                     severity="warning",
                 )
             else:
-                interval = 365.0 / max(1, medication["fills_per_year"])
-                for fill_index in range(medication["fills_per_year"]):
-                    fill_events.append((fill_index * interval, fill_index + 1, medication, basis))
+                fill_events.extend(
+                    _build_scheduled_fill_events(
+                        medication,
+                        basis,
+                        channel_summary,
+                        beneficiary.pharmacy_preference,
+                    )
+                )
             drug_state[medication_id] = state
 
-        fill_events.sort(key=lambda item: item[0])
-        for day_offset, fill_number, medication, basis in fill_events:
-            medication_id = str(medication["medication_id"])
+        fill_events.sort(key=_scheduled_fill_sort_key)
+        for sequence_index, scheduled_event in enumerate(fill_events, start=1):
+            medication = scheduled_event.medication
+            basis = scheduled_event.basis
+            day_offset = scheduled_event.day_offset
+            fill_number = scheduled_event.fill_number
+            medication_id = str(scheduled_event.medication_id)
             drug_name = str(medication["drug_name"])
             state = drug_state[medication_id]
-            best_channel: str | None = None
-            best_result: FillCostResult | None = None
-            for channel in ("pref_retail", "nonpref_retail", "pref_mail", "nonpref_mail"):
-                if not _channel_available(channel_summary, channel, beneficiary.pharmacy_preference):
-                    continue
+            channel_results: list[tuple[str, FillCostResult]] = []
+            for channel in scheduled_event.available_channels:
                 channel_result = _simulate_fill_cost(
                     basis,
                     channel_summary,
@@ -1620,10 +1796,13 @@ def recommend_plans(
                 )
                 if channel_result is None:
                     continue
-                if best_result is None or channel_result.total_oop < best_result.total_oop:
-                    best_result = channel_result
-                    best_channel = channel
+                channel_results.append((channel, channel_result))
 
+            best_channel, best_result = _select_best_channel_result(
+                channel_results,
+                state["last_selected_channel"],
+                beneficiary.pharmacy_preference,
+            )
             if best_channel is None or best_result is None:
                 state["coverage_status"] = "channel_unavailable"
                 state["pricing_status"] = "channel_unavailable"
@@ -1639,6 +1818,10 @@ def recommend_plans(
                 )
                 continue
 
+            previous_channel = state["last_selected_channel"]
+            if previous_channel is not None and previous_channel != best_channel:
+                state["channel_switch_count"] += 1
+            state["last_selected_channel"] = best_channel
             remaining_deductible = best_result.deductible_after
             oop_accumulated = best_result.oop_after
             troop_accumulated = best_result.troop_after
@@ -1658,7 +1841,8 @@ def recommend_plans(
             state["fill_traces"].append(
                 DrugFillTrace(
                     fill_number=fill_number,
-                    day_offset=int(round(day_offset)),
+                    day_offset=day_offset,
+                    sequence_index=sequence_index,
                     selected_channel=best_channel,
                     coverage_phase=best_result.coverage_phase,
                     pricing_status=best_result.pricing_status,
@@ -1729,7 +1913,6 @@ def recommend_plans(
                     message,
                     related_drug=drug_name,
                     related_channel=best_channel,
-                    severity="warning",
                 )
             if best_result.deductible_exposure > 0:
                 message = f"{drug_name} adds about ${best_result.deductible_exposure:.2f} of deductible exposure."
@@ -1873,6 +2056,8 @@ def recommend_plans(
             )
 
         coverage_status = "full" if uncovered_count == 0 else "partial"
+        priced_drug_count = sum(1 for item in breakdowns if item.pricing_status == "priced")
+        channel_switch_count = sum(int(state["channel_switch_count"]) for state in drug_state.values())
         restriction_count = sum(int(value) for value in plan_restriction_flags.values())
         restriction_summary = _build_restriction_summary(restriction_count, plan_restriction_flags)
         explanation_groups = PlanExplanationGroups(
@@ -1912,7 +2097,14 @@ def recommend_plans(
                 monthly_cost_estimate=round(total_cost / 12.0, 2),
                 coverage_status=coverage_status,
                 best_channel_mix=", ".join(
-                    f"{channel}:{count}" for channel, count in sorted(selected_channels.items())
+                    f"{channel}:{count}"
+                    for channel, count in sorted(
+                        selected_channels.items(),
+                        key=lambda item: (
+                            CHANNEL_ORDER.index(item[0]) if item[0] in CHANNEL_ORDER else len(CHANNEL_ORDER),
+                            item[0],
+                        ),
+                    )
                 )
                 or "no covered fills",
                 network_flag=str(plan["network_flag"]),
@@ -1956,21 +2148,14 @@ def recommend_plans(
                 drug_breakdowns=breakdowns,
                 contract_year=contract_year,
                 benefit_design=benefit_design,
+                priced_drug_count=priced_drug_count,
+                channel_switch_count=channel_switch_count,
+                simulation_policy=SIMULATION_POLICY,
             )
         )
 
     _apply_fit_scoring(recommendations, beneficiary)
-    recommendations.sort(
-        key=lambda item: (
-            1 if item.coverage_status != "full" else 0,
-            -item.fit_score,
-            item.annual_total_cost,
-            item.uncovered_drug_count,
-            item.restriction_count,
-            NETWORK_PRIORITY.get(item.network_flag, 99),
-            item.plan_name,
-        )
-    )
+    recommendations.sort(key=_rules_ranking_sort_key)
     for rank, recommendation in enumerate(recommendations, start=1):
         recommendation.plan_rank = rank
 
@@ -2011,6 +2196,9 @@ def recommendations_to_frame(recommendations: list[PlanRecommendation]) -> pd.Da
                 "feature_version": recommendation.feature_version,
                 "contract_year": recommendation.contract_year,
                 "benefit_design": recommendation.benefit_design,
+                "priced_drug_count": recommendation.priced_drug_count,
+                "channel_switch_count": recommendation.channel_switch_count,
+                "simulation_policy": recommendation.simulation_policy,
                 "best_channel_mix": recommendation.best_channel_mix,
                 "network_flag": recommendation.network_flag,
                 "network_access_summary": recommendation.network_access_summary,
@@ -2059,6 +2247,9 @@ def recommendations_to_comparison_frame(recommendations: list[PlanRecommendation
                 "stability_score": recommendation.fit_metrics.stability_score,
                 "contract_year": recommendation.contract_year,
                 "benefit_design": recommendation.benefit_design,
+                "priced_drug_count": recommendation.priced_drug_count,
+                "channel_switch_count": recommendation.channel_switch_count,
+                "simulation_policy": recommendation.simulation_policy,
                 "restriction_summary": recommendation.restriction_summary,
                 "channel_mix": recommendation.best_channel_mix,
                 "service_area_eligible": recommendation.service_area_eligible,
