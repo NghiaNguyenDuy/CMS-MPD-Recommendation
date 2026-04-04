@@ -1,26 +1,29 @@
-# Implementation Plan: Reranker Feature Expansion
+# Implementation Plan: Beneficiary What-If Scenario Tooling
 
 ## Goal
-Strengthen hybrid reranker inputs by feeding it the rules-engine signals that were newly introduced in the cost-realism and counselor-timeline sprints: how much of the regimen was actually priceable, and how uneven the beneficiary's monthly cost pressure looks across the simulated year.
+Extend the Decision Support flow so counselors can keep the same medication list, baseline recommendation run, and audited rules engine, then quickly compare how alternate beneficiary assumptions or shortlist postures change the top plans.
 
 ## Implemented Changes
 | Step | Outcome | Main Files |
 |------|---------|------------|
-| 1 | Added `priced_drug_share` to feature rows so the model sees explicit priceability instead of only raw counts | `modeling.py` |
-| 2 | Added `monthly_drug_oop_variance` and `monthly_total_variance` from fill-trace timing | `modeling.py` |
-| 3 | Updated the full-model numeric feature contract and richer ablation subsets | `modeling.py` |
-| 4 | Bumped the dataset schema version to track the expanded reranker feature set | `modeling.py` |
-| 5 | Added focused regression coverage plus smoke assertions for the new dataset columns | `tests/test_recommendation_flow_realism.py`, `tests/test_pipeline_smoke.py` |
+| 1 | Added reusable scenario presets for pharmacy preference, LIS status, and alternate shortlist goals | `src/cms_mpd/app_support.py` |
+| 2 | Added a scenario-runner path that reuses the same recommendation engine and dataframe export surface | `streamlit_app.py` |
+| 3 | Added a scenario summary frame with baseline deltas for annual cost, coverage, priceability, and channel switching | `src/cms_mpd/app_support.py` |
+| 4 | Added results-tab rendering for scenario summary, shortlist previews, side-by-side comparisons, and top-plan details | `streamlit_app.py` |
+| 5 | Added regression coverage for scenario generation and summary interpretation | `tests/test_contracts.py` |
 
-## Current Modeling Surface
-- Training and inference feature rows now include:
-  - `priced_drug_share`
-  - `monthly_drug_oop_variance`
-  - `monthly_total_variance`
-- The tree and linear reranker artifacts now train on dataset schema `request_features_v4`.
-- Held-out evaluation remains scenario-based and unchanged in method; it now just sees stronger temporal and priceability features.
+## Current Scenario Surface
+- Decision Support results now include a `Beneficiary what-if scenarios` section after the baseline shortlist.
+- Scenario presets currently cover:
+  - alternate pharmacy preferences: `auto`, `retail`, `mail`
+  - alternate LIS assumptions: `partial`, `full`
+  - alternate shortlist goals: lowest annual cost, safest medication coverage, easiest pharmacy access
+- Each scenario run reuses the same medication list and recommendation engine, then shows:
+  - top-plan change versus baseline
+  - annual total-cost delta versus baseline
+  - coverage percent, priced-med count, and channel-switch count
+  - a scenario-specific shortlist preview and top-plan details
 
 ## Next Technical Candidates
-- Build what-if scenario tooling on top of the now-richer annual simulation outputs.
-- Add counselor-facing toggles for stable channel preference vs lowest-single-fill OOP.
-- Decide whether monthly timeline rows should be exportable through CSV and audit payloads.
+- Add explicit counselor toggles for stable channel preference versus lowest projected single-fill OOP.
+- Decide whether monthly timeline rows should become downloadable CSV or audit outputs.

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 import math
 
 import pandas as pd
 
-from .decision_support import MedicationListItem, PreferenceWeights, ProfileInput
+from .decision_support import (
+    MedicationListItem,
+    PreferenceWeights,
+    ProfileInput,
+    recommend_preference_preset,
+)
 from .recommend import MedicationInput, PlanDrugBreakdown, PlanRecommendation
 
 
@@ -62,6 +67,15 @@ FOCUS_MAP = {
     "Easiest pharmacy access": "pharmacy_access",
     "Conservative compare and verify": "low_friction",
 }
+
+
+@dataclass(frozen=True)
+class WhatIfScenario:
+    key: str
+    label: str
+    description: str
+    profile: ProfileInput
+    preferences: PreferenceWeights
 
 
 def coerce_zipcode(value: str | None) -> str:
@@ -393,6 +407,188 @@ def build_monthly_timeline_frame(recommendation: PlanRecommendation) -> pd.DataF
     return pd.DataFrame(normalized_rows)
 
 
+def build_what_if_scenarios(
+    profile: ProfileInput,
+    preferences: PreferenceWeights,
+    *,
+    has_medications: bool,
+) -> list[WhatIfScenario]:
+    scenarios: list[WhatIfScenario] = []
+
+    pharmacy_variants = [
+        (
+            "auto",
+            "Allow auto channel choice",
+            "Let the engine keep choosing the most plan-friendly available channel mix.",
+        ),
+        (
+            "retail",
+            "Prefer retail pickup",
+            "Assume the beneficiary wants local retail pickup whenever the plan allows it.",
+        ),
+        (
+            "mail",
+            "Prefer mail order",
+            "Assume the beneficiary is willing to lean on mail order when it helps the plan fit.",
+        ),
+    ]
+    for pharmacy_preference, label, description in pharmacy_variants:
+        if profile.pharmacy_preference == pharmacy_preference:
+            continue
+        scenarios.append(
+            WhatIfScenario(
+                key=f"pharmacy_{pharmacy_preference}",
+                label=label,
+                description=description,
+                profile=replace(profile, pharmacy_preference=pharmacy_preference),
+                preferences=preferences,
+            )
+        )
+
+    lis_variants = [
+        ("partial", "Assume partial LIS", "Model the same regimen with partial LIS cost-sharing support."),
+        ("full", "Assume full LIS", "Model the same regimen with full LIS cost-sharing support."),
+    ]
+    for lis_status, label, description in lis_variants:
+        if profile.lis_status == lis_status:
+            continue
+        scenarios.append(
+            WhatIfScenario(
+                key=f"lis_{lis_status}",
+                label=label,
+                description=description,
+                profile=replace(profile, lis_status=lis_status),
+                preferences=preferences,
+            )
+        )
+
+    goal_variants = [
+        ("Lowest annual cost", "Optimize for lowest annual cost"),
+        ("Safest medication coverage", "Optimize for safest medication coverage"),
+        ("Easiest pharmacy access", "Optimize for easiest pharmacy access"),
+    ]
+    for primary_goal, label in goal_variants:
+        if preferences.primary_goal == primary_goal:
+            continue
+        preset = recommend_preference_preset(profile.persona, primary_goal, has_medications)
+        scenarios.append(
+            WhatIfScenario(
+                key=f"goal_{primary_goal.lower().replace(' ', '_')}",
+                label=label,
+                description=(
+                    f"Keep the beneficiary profile the same, but change the shortlist posture to {primary_goal.lower()}."
+                ),
+                profile=profile,
+                preferences=replace(
+                    preferences,
+                    primary_goal=primary_goal,
+                    minimum_coverage_pct=float(preset["minimum_coverage_pct"]),
+                ),
+            )
+        )
+
+    deduped: list[WhatIfScenario] = []
+    seen: set[str] = set()
+    for scenario in scenarios:
+        if scenario.key in seen:
+            continue
+        deduped.append(scenario)
+        seen.add(scenario.key)
+    return deduped
+
+
+def build_what_if_summary_frame(
+    baseline_frame: pd.DataFrame,
+    scenario_runs: list[tuple[WhatIfScenario, pd.DataFrame]],
+) -> pd.DataFrame:
+    columns = [
+        "Scenario",
+        "Assumption change",
+        "Top plan",
+        "Top plan changed",
+        "Estimated annual total cost",
+        "Delta vs baseline top plan",
+        "Estimated annual OOP",
+        "Coverage percent",
+        "Priced medications",
+        "Channel switches",
+        "Recommendation tier",
+        "Ranking source",
+    ]
+    if baseline_frame is None or baseline_frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    baseline_top = baseline_frame.iloc[0]
+    baseline_plan_key = str(baseline_top.get("PLAN_KEY") or "")
+    baseline_total_cost = float(baseline_top.get("estimated_total_annual_cost") or 0.0)
+    rows: list[dict[str, object]] = []
+    for scenario, frame in scenario_runs:
+        if frame is None or frame.empty:
+            rows.append(
+                {
+                    "Scenario": scenario.label,
+                    "Assumption change": scenario.description,
+                    "Top plan": "No eligible plan returned",
+                    "Top plan changed": "n/a",
+                    "Estimated annual total cost": None,
+                    "Delta vs baseline top plan": None,
+                    "Estimated annual OOP": None,
+                    "Coverage percent": None,
+                    "Priced medications": 0,
+                    "Channel switches": 0,
+                    "Recommendation tier": "No eligible plan returned",
+                    "Ranking source": "",
+                }
+            )
+            continue
+
+        top = frame.iloc[0]
+        top_plan_key = str(top.get("PLAN_KEY") or "")
+        total_cost = float(top.get("estimated_total_annual_cost") or 0.0)
+        rows.append(
+            {
+                "Scenario": scenario.label,
+                "Assumption change": scenario.description,
+                "Top plan": str(top.get("PLAN_NAME") or top_plan_key or "Unknown plan"),
+                "Top plan changed": "Changed" if top_plan_key != baseline_plan_key else "Stable",
+                "Estimated annual total cost": round(total_cost, 2),
+                "Delta vs baseline top plan": round(total_cost - baseline_total_cost, 2),
+                "Estimated annual OOP": round(float(top.get("estimated_annual_oop") or 0.0), 2),
+                "Coverage percent": round(float(top.get("coverage_pct_requested") or 0.0), 2),
+                "Priced medications": int(top.get("priced_drug_count") or 0),
+                "Channel switches": int(top.get("channel_switch_count") or 0),
+                "Recommendation tier": str(top.get("recommendation_tier") or ""),
+                "Ranking source": str(top.get("ranking_source") or ""),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def summarize_what_if_findings(summary_frame: pd.DataFrame) -> str:
+    if summary_frame is None or summary_frame.empty:
+        return "Run one or more what-if scenarios to compare how alternate beneficiary assumptions shift the shortlist."
+
+    changed_count = int((summary_frame["Top plan changed"] == "Changed").sum())
+    total_count = int(len(summary_frame))
+    numeric_costs = summary_frame["Estimated annual total cost"].dropna()
+    if numeric_costs.empty:
+        return "The selected what-if scenarios did not return any eligible plans."
+
+    lowest_index = numeric_costs.astype(float).idxmin()
+    lowest_row = summary_frame.loc[lowest_index]
+    if changed_count == 0:
+        return (
+            f"The top eligible plan stayed stable across all {total_count} what-if scenario(s). "
+            f"The lowest alternate cost still came from {lowest_row['Scenario']} at "
+            f"${float(lowest_row['Estimated annual total cost']):,.0f}."
+        )
+    return (
+        f"{changed_count} of {total_count} what-if scenario(s) changed the top eligible plan. "
+        f"The lowest alternate cost came from {lowest_row['Scenario']} at "
+        f"${float(lowest_row['Estimated annual total cost']):,.0f}."
+    )
+
+
 def build_side_by_side_frame(
     frame: pd.DataFrame,
     selected_plan_keys: list[str] | None = None,
@@ -542,6 +738,8 @@ __all__ = [
     "build_counselor_note",
     "build_monthly_timeline_frame",
     "build_side_by_side_frame",
+    "build_what_if_scenarios",
+    "build_what_if_summary_frame",
     "catalog_available_day_supply_options",
     "catalog_tier_family_options",
     "coerce_zipcode",
@@ -551,4 +749,6 @@ __all__ = [
     "search_drug_catalog",
     "summarize_drug_channel_path",
     "summarize_evidence_gaps",
+    "summarize_what_if_findings",
+    "WhatIfScenario",
 ]

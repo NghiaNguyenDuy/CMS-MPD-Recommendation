@@ -30,6 +30,8 @@ from cms_mpd.app_support import (
     build_medication_row_from_catalog,
     build_monthly_timeline_frame,
     build_side_by_side_frame,
+    build_what_if_scenarios,
+    build_what_if_summary_frame,
     catalog_available_day_supply_options,
     catalog_tier_family_options,
     coerce_zipcode,
@@ -39,6 +41,7 @@ from cms_mpd.app_support import (
     search_drug_catalog,
     summarize_drug_channel_path,
     summarize_evidence_gaps,
+    summarize_what_if_findings,
 )
 from cms_mpd.decision_support import (
     MedicationListItem,
@@ -378,6 +381,147 @@ def _comparison_recommendations(
     return result
 
 
+def _beneficiary_from_contracts(
+    profile_contract: ProfileInput,
+    preference_contract: PreferenceWeights,
+) -> BeneficiaryInput:
+    return BeneficiaryInput(
+        zipcode=profile_contract.zipcode,
+        age_band=profile_contract.age_band,
+        lis_status=profile_contract.lis_status,
+        chronic_condition_flags=profile_contract.chronic_condition_flags or None,
+        pharmacy_preference=profile_contract.pharmacy_preference,
+        top_n=profile_contract.top_n,
+        user_role=ROLE_MAP[profile_contract.persona],
+        decision_focus=FOCUS_MAP[preference_contract.primary_goal],
+    )
+
+
+def _run_what_if_scenarios(
+    config: PipelineConfig,
+    scenario_specs: list,
+    medications: list,
+) -> list[dict[str, object]]:
+    scenario_runs: list[dict[str, object]] = []
+    for scenario in scenario_specs:
+        beneficiary = _beneficiary_from_contracts(scenario.profile, scenario.preferences)
+        recommendations = recommend_plans(
+            beneficiary,
+            medications,
+            config=config,
+            ranking_mode=scenario.preferences.ranking_mode,
+        )
+        frame = recommendations_to_dataframe(
+            recommendations,
+            run_id=uuid.uuid4().hex[:12],
+            comparison_only=False,
+            minimum_coverage_pct=scenario.preferences.minimum_coverage_pct,
+        )
+        scenario_runs.append(
+            {
+                "key": scenario.key,
+                "label": scenario.label,
+                "description": scenario.description,
+                "profile": scenario.profile,
+                "preferences": scenario.preferences,
+                "recommendations": recommendations,
+                "frame": frame,
+                "note": build_counselor_note(
+                    scenario.profile,
+                    scenario.preferences,
+                    frame,
+                    pd.DataFrame(),
+                ),
+            }
+        )
+    return scenario_runs
+
+
+def _render_what_if_section(
+    config: PipelineConfig,
+    profile_contract: ProfileInput,
+    preference_contract: PreferenceWeights,
+    medications: list,
+    baseline_frame: pd.DataFrame,
+) -> None:
+    st.markdown("#### Beneficiary what-if scenarios")
+    scenario_specs = build_what_if_scenarios(
+        profile_contract,
+        preference_contract,
+        has_medications=bool(medications),
+    )
+    if not scenario_specs:
+        st.caption("No alternate what-if scenarios are available for the current beneficiary inputs.")
+        return
+
+    scenario_lookup = {scenario.key: scenario for scenario in scenario_specs}
+    selected_keys = st.multiselect(
+        "Compare alternate beneficiary assumptions",
+        options=list(scenario_lookup.keys()),
+        key="what_if_selected_scenarios",
+        format_func=lambda key: scenario_lookup[key].label,
+        help="Run the same medication list against alternate beneficiary assumptions or shortlist postures.",
+    )
+    selected_scenarios = [scenario_lookup[key] for key in selected_keys if key in scenario_lookup]
+    if selected_scenarios:
+        st.caption(
+            " | ".join(
+                f"{scenario.label}: {scenario.description}" for scenario in selected_scenarios
+            )
+        )
+        if st.button("Run what-if scenarios", use_container_width=True):
+            with st.spinner("Running beneficiary what-if scenarios..."):
+                scenario_runs = _run_what_if_scenarios(config, selected_scenarios, medications)
+            st.session_state["what_if_runs"] = scenario_runs
+            st.session_state["what_if_summary_df"] = build_what_if_summary_frame(
+                baseline_frame,
+                [(scenario_lookup[run["key"]], run["frame"]) for run in scenario_runs],
+            )
+            st.session_state["what_if_note"] = summarize_what_if_findings(
+                st.session_state["what_if_summary_df"]
+            )
+            st.session_state["what_if_run_keys"] = list(selected_keys)
+    else:
+        st.caption("Pick one or more scenarios to see how the shortlist shifts under alternate assumptions.")
+
+    stored_keys = st.session_state.get("what_if_run_keys", [])
+    selection_changed = list(selected_keys) != list(stored_keys)
+    scenario_runs = st.session_state.get("what_if_runs", [])
+    summary_frame = st.session_state.get("what_if_summary_df", pd.DataFrame())
+    what_if_note = st.session_state.get("what_if_note", "")
+
+    if selection_changed and scenario_runs:
+        st.caption("Scenario selection changed. Run the what-if analysis again to refresh the comparison.")
+        return
+    if summary_frame is None or summary_frame.empty:
+        return
+
+    if what_if_note:
+        st.info(what_if_note)
+    st.dataframe(summary_frame, use_container_width=True, hide_index=True)
+
+    tabs = st.tabs([run["label"] for run in scenario_runs])
+    for tab, run in zip(tabs, scenario_runs, strict=False):
+        with tab:
+            st.caption(str(run["description"]))
+            if run.get("note"):
+                st.info(str(run["note"]))
+            frame = run.get("frame")
+            recommendations = run.get("recommendations") or []
+            if frame is None or frame.empty:
+                st.warning("No eligible plans were returned for this scenario.")
+                continue
+            st.dataframe(frame.head(5), use_container_width=True, hide_index=True)
+            preview_keys = frame["PLAN_KEY"].head(3).tolist()
+            scenario_side_by_side = build_side_by_side_frame(frame, preview_keys)
+            if not scenario_side_by_side.empty:
+                st.markdown("**Scenario side-by-side**")
+                st.dataframe(scenario_side_by_side, use_container_width=True, hide_index=True)
+            if recommendations:
+                st.markdown("**Top scenario plan details**")
+                _render_plan_details(recommendations[:1])
+
+
 def _render_metric_cards(frame: pd.DataFrame) -> None:
     if frame.empty:
         return
@@ -632,6 +776,11 @@ def main() -> None:
         "medication_editor_seed": DEFAULT_MEDICATION_ROWS,
         "medication_editor_rows": DEFAULT_MEDICATION_ROWS,
         "medication_search_query": "",
+        "what_if_selected_scenarios": [],
+        "what_if_run_keys": [],
+        "what_if_runs": [],
+        "what_if_summary_df": pd.DataFrame(),
+        "what_if_note": "",
     }.items():
         st.session_state.setdefault(key, value)
 
@@ -852,16 +1001,7 @@ def main() -> None:
                 for error in errors:
                     st.error(error)
             else:
-                beneficiary = BeneficiaryInput(
-                    zipcode=profile_contract.zipcode,
-                    age_band=profile_contract.age_band,
-                    lis_status=profile_contract.lis_status,
-                    chronic_condition_flags=profile_contract.chronic_condition_flags or None,
-                    pharmacy_preference=profile_contract.pharmacy_preference,
-                    top_n=profile_contract.top_n,
-                    user_role=ROLE_MAP[profile_contract.persona],
-                    decision_focus=FOCUS_MAP[preference_contract.primary_goal],
-                )
+                beneficiary = _beneficiary_from_contracts(profile_contract, preference_contract)
                 with st.spinner("Running recommendation engine and comparison workflow..."):
                     recommendations = recommend_plans(
                         beneficiary,
@@ -922,6 +1062,10 @@ def main() -> None:
                     result_df,
                     comparison_df,
                 )
+                st.session_state["what_if_runs"] = []
+                st.session_state["what_if_summary_df"] = pd.DataFrame()
+                st.session_state["what_if_note"] = ""
+                st.session_state["what_if_run_keys"] = []
 
         result_df = st.session_state.get("result_df")
         comparison_df = st.session_state.get("comparison_df", pd.DataFrame())
@@ -930,6 +1074,9 @@ def main() -> None:
         recommendations = st.session_state.get("recommendations", [])
         comparison_recommendations = st.session_state.get("comparison_recommendations", [])
         counselor_note = st.session_state.get("counselor_note")
+        current_profile_contract: ProfileInput | None = st.session_state.get("profile_contract")
+        current_preference_contract: PreferenceWeights | None = st.session_state.get("preference_contract")
+        current_medications = st.session_state.get("medications", [])
         if result_df is None or result_df.empty:
             st.info("Complete the first three steps, then run decision support to generate a shortlist.")
             return
@@ -960,6 +1107,15 @@ def main() -> None:
         if counselor_note:
             st.markdown("#### Counselor note")
             st.info(counselor_note)
+
+        if current_profile_contract is not None and current_preference_contract is not None:
+            _render_what_if_section(
+                config,
+                current_profile_contract,
+                current_preference_contract,
+                current_medications,
+                result_df,
+            )
 
         evidence_gaps = summarize_evidence_gaps(result_df, comparison_df)
         if evidence_gaps:

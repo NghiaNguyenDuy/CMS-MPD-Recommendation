@@ -1,35 +1,24 @@
-# Reranker Feature Expansion Walkthrough
+# Beneficiary What-If Scenario Walkthrough
 
 ## Summary
-The hybrid reranker already consumed rules-engine outputs, but it still lacked two important signals introduced by recent sprints:
-- how much of the entered regimen was actually priceable
-- how uneven cost pressure was across the year
+The recommendation flow already supported a strong baseline run, side-by-side plan comparison, and counselor-facing timeline review. This phase adds a lightweight scenario-analysis layer on top of that baseline so counselors can ask, "What changes if this beneficiary prefers mail order, qualifies for LIS, or needs a stricter coverage-first shortlist?" without rebuilding the case from scratch.
 
-This phase closes that gap by pushing both priceability share and monthly cost-variance features into the training and inference feature frames.
+## What Was Added
+- Reusable scenario presets generated from the current beneficiary profile and shortlist posture.
+- A results-tab action that reruns the same medication list under selected alternate assumptions.
+- A summary table that compares each scenario back to the baseline shortlist.
+- Per-scenario shortlist previews, side-by-side plan comparisons, and top-plan detail drilldowns.
 
-## New Features
-- `priced_drug_share`
-  - beneficiary-facing meaning: how much of the requested medication list produced usable simulated pricing
-  - modeling value: separates partial-but-usable plans from weak fallback plans more clearly than counts alone
-- `monthly_drug_oop_variance`
-  - measures how uneven drug cost-sharing is across the simulated year
-- `monthly_total_variance`
-  - measures how uneven combined premium-plus-drug cost pressure is across the simulated year
-
-## How They Are Derived
-- `priced_drug_share` is computed from `priced_drug_count / requested_drug_count`.
-- Monthly variance features are derived from the same fill traces used by the counselor timeline view:
-  - fills are bucketed into 12 relative plan-year months
-  - monthly drug OOP totals are aggregated
-  - monthly total cost adds the monthly premium to those buckets
-  - variance is computed across the 12-month vectors
+## Scenario Coverage
+- Pharmacy preference scenarios compare `auto`, `retail`, and `mail` assumptions.
+- LIS scenarios model `partial` and `full` subsidy support when they differ from the current input.
+- Goal scenarios re-run the shortlist under alternate postures such as lowest total cost or safest medication coverage.
 
 ## Why This Matters
-- The reranker can now distinguish a plan that looks acceptable annually but produces a spiky early-year burden.
-- Priceability is represented as a normalized share rather than only a raw count, which improves comparability across medication-list sizes.
-- The research dataset and production inference frame now stay better aligned with what counselors actually see in the UI.
+- Counselors can test realistic beneficiary questions without re-entering the regimen.
+- The comparison stays grounded in the same audited rules engine and output contracts already used by the main flow.
+- Plan movement becomes easier to explain because the summary shows whether the top plan stayed stable or changed under each alternate assumption.
 
 ## Remaining Next Steps
-- Build beneficiary what-if scenario tooling.
-- Add UI toggles for stable-channel preference vs lowest projected single-fill OOP.
-- Decide whether monthly timeline rows should become downloadable public outputs.
+- Add UI controls for choosing stable-channel policy versus lowest projected single-fill OOP.
+- Decide whether monthly timeline rows should be exportable outside the Streamlit view.

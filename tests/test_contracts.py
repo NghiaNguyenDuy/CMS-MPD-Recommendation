@@ -9,6 +9,8 @@ from cms_mpd.app_support import (
     build_medication_row_from_catalog,
     build_monthly_timeline_frame,
     build_side_by_side_frame,
+    build_what_if_scenarios,
+    build_what_if_summary_frame,
     catalog_available_day_supply_options,
     catalog_tier_family_options,
     format_drug_catalog_option,
@@ -16,6 +18,7 @@ from cms_mpd.app_support import (
     search_drug_catalog,
     summarize_drug_channel_path,
     summarize_evidence_gaps,
+    summarize_what_if_findings,
 )
 from cms_mpd.config import PipelineConfig
 from cms_mpd.decision_support import (
@@ -430,6 +433,87 @@ def test_drug_catalog_search_and_add_row_helpers():
     updated_rows = append_medication_row([], new_row)
     assert len(updated_rows) == 1
     assert updated_rows[0]["ndc"] == "00000000002"
+
+
+def test_what_if_scenario_helpers_build_summary():
+    profile = ProfileInput(
+        persona="Counselor",
+        zipcode="43004",
+        age_band="65-74",
+        lis_status="none",
+        pharmacy_preference="auto",
+        chronic_condition_flags=["diabetes"],
+        top_n=5,
+    )
+    preferences = PreferenceWeights(
+        primary_goal="Balanced recommendation",
+        minimum_coverage_pct=90.0,
+        allow_comparison_plans=False,
+        max_comparison_distance_miles=50,
+        ranking_mode="rules",
+    )
+
+    scenarios = build_what_if_scenarios(profile, preferences, has_medications=True)
+    scenario_keys = {scenario.key for scenario in scenarios}
+
+    assert {"pharmacy_retail", "pharmacy_mail", "lis_partial", "lis_full"}.issubset(scenario_keys)
+    assert "goal_lowest_annual_cost" in scenario_keys
+
+    lowest_cost_scenario = next(item for item in scenarios if item.key == "goal_lowest_annual_cost")
+    assert lowest_cost_scenario.preferences.primary_goal == "Lowest annual cost"
+    assert lowest_cost_scenario.preferences.minimum_coverage_pct == 85.0
+
+    baseline_frame = recommendations_to_dataframe(
+        [
+            _sample_recommendation(
+                plan_key="P1",
+                plan_name="Alpha Choice",
+                annual_total_cost=1200.0,
+                annual_premium=360.0,
+                annual_drug_oop=840.0,
+            )
+        ],
+        run_id="baseline123",
+        minimum_coverage_pct=90.0,
+    )
+    scenario_frame = recommendations_to_dataframe(
+        [
+            _sample_recommendation(
+                plan_key="P3",
+                plan_name="Gamma Nearby",
+                annual_total_cost=1100.0,
+                annual_premium=240.0,
+                annual_drug_oop=860.0,
+            )
+        ],
+        run_id="scenario123",
+        minimum_coverage_pct=90.0,
+    )
+    mail_scenario = next(item for item in scenarios if item.key == "pharmacy_mail")
+
+    summary_frame = build_what_if_summary_frame(baseline_frame, [(mail_scenario, scenario_frame)])
+    finding = summarize_what_if_findings(summary_frame)
+
+    assert list(summary_frame.columns) == [
+        "Scenario",
+        "Assumption change",
+        "Top plan",
+        "Top plan changed",
+        "Estimated annual total cost",
+        "Delta vs baseline top plan",
+        "Estimated annual OOP",
+        "Coverage percent",
+        "Priced medications",
+        "Channel switches",
+        "Recommendation tier",
+        "Ranking source",
+    ]
+    assert summary_frame.iloc[0]["Scenario"] == mail_scenario.label
+    assert summary_frame.iloc[0]["Top plan"] == "Gamma Nearby"
+    assert summary_frame.iloc[0]["Top plan changed"] == "Changed"
+    assert summary_frame.iloc[0]["Delta vs baseline top plan"] == -100.0
+    assert "changed the top eligible plan" in finding
+
 
 
 def test_decision_support_exports_and_counselor_note():

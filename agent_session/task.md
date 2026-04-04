@@ -5,23 +5,19 @@
 - The cost-realism recommendation-flow sprint is complete.
 - Counselor-facing outputs now expose monthly cash-flow timing and medication-level channel-path behavior from the same audited fill traces.
 - Hybrid reranker training now consumes explicit priceability-share and monthly variance features from the simulated annual ledger.
+- Beneficiary what-if scenario analysis is now available in the Decision Support results tab for alternate beneficiary assumptions and shortlist postures.
 
-## Completed Reranker Feature Expansion
-- [x] Add `priced_drug_share` to training and inference feature rows.
-- [x] Add monthly temporal-cost features derived from fill timing:
-  - `monthly_drug_oop_variance`
-  - `monthly_total_variance`
-- [x] Bump dataset schema version so reranker artifacts reflect the expanded feature contract.
-- [x] Feed the new features into full-model training and the richer ablation subsets.
-- [x] Add focused regression coverage for priceability share and monthly variance behavior.
-- [x] Extend smoke coverage so generated training datasets must include the new features.
+## Completed Beneficiary What-If Scenario Tooling
+- [x] Added reusable what-if scenario presets for pharmacy preference, LIS status, and shortlist posture changes.
+- [x] Added a results-tab workflow to run alternate scenarios against the same medication list without leaving the current recommendation flow.
+- [x] Added a scenario summary table showing top-plan changes, annual cost deltas, coverage, priceability, and channel-switch differences versus baseline.
+- [x] Added per-scenario shortlist previews, side-by-side plan comparisons, and top-plan detail drilldowns.
+- [x] Added focused regression coverage for scenario preset generation and summary interpretation.
 
 ## Validation Snapshot
-- Focused reranker-feature verification passed on recommendation-flow and pipeline smoke tests.
-- Latest focused verification for this sprint: `8 passed`.
-- Full-suite verification remains the final gate after every completed phase.
+- Focused what-if scenario verification passed: `6 passed`.
+- Full-suite verification after this phase passed: `27 passed in 7.76s`.
 
 ## Remaining Follow-On Opportunities
-- [ ] Expand scenario-analysis tooling for beneficiary what-if comparisons.
 - [ ] Add counselor-facing scenario toggles for stable channel preference vs lowest projected single-fill OOP.
-- [ ] Add downloadable monthly timeline extracts to the public CSV/audit surfaces if operational users need them outside Streamlit.
+- [ ] Add downloadable monthly timeline extracts to the public CSV and audit surfaces if operational users need them outside Streamlit.
