@@ -1,0 +1,20 @@
+[
+  {
+    "drug_name": "insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+    "rxcui": "2563977",
+    "ndc": "83257001111",
+    "tier_family": "brand",
+    "day_supply": 30,
+    "quantity_override": null,
+    "fills_per_year_override": null
+  },
+  {
+    "drug_name": "rosuvastatin calcium 10 MG Oral Tablet",
+    "rxcui": "859747",
+    "ndc": "68462026290",
+    "tier_family": "specialty",
+    "day_supply": 30,
+    "quantity_override": null,
+    "fills_per_year_override": null
+  }
+]

@@ -9,7 +9,7 @@ import uuid
 
 import pandas as pd
 
-from .recommend import PlanRecommendation
+from .recommend import PlanRecommendation, RecommendationBundle
 
 
 DEFAULT_RESEARCH_SEED = 42
@@ -22,8 +22,12 @@ RECOMMENDATION_SCHEMA_COLUMNS = [
     "recommendation_tier",
     "coverage_status",
     "coverage_pct_requested",
+    "annual_premium",
+    "annual_drug_oop",
     "estimated_annual_oop",
     "estimated_total_annual_cost",
+    "uncovered_drug_count",
+    "restriction_summary",
     "cost_breakdown",
     "access_summary",
     "warning_flags",
@@ -42,6 +46,28 @@ RECOMMENDATION_SCHEMA_COLUMNS = [
     "priced_drug_count",
     "channel_switch_count",
     "simulation_policy",
+]
+BUNDLE_SUMMARY_COLUMNS = [
+    "requested_drug_count",
+    "local_candidate_plan_count",
+    "local_full_coverage_count",
+    "local_partial_count",
+    "fallback_reason",
+]
+BUNDLE_BLOCKED_COLUMNS = [
+    "medication_id",
+    "requested_drug_name",
+    "resolved_drug_name",
+    "ndc",
+    "rxcui",
+    "local_coverable_plan_count",
+    "blocker_type",
+]
+BUNDLE_ALTERNATIVE_COLUMNS = [
+    "medication_id",
+    "requested_drug_name",
+    "resolved_drug_name",
+    "search_term",
 ]
 
 CONFIDENCE_SCORE_MAP = {
@@ -276,8 +302,12 @@ def recommendations_to_dataframe(
             ),
             "coverage_status": recommendation.coverage_status,
             "coverage_pct_requested": coverage_pct,
+            "annual_premium": round(float(recommendation.annual_premium), 2),
+            "annual_drug_oop": round(float(recommendation.annual_drug_oop), 2),
             "estimated_annual_oop": round(float(recommendation.annual_drug_oop), 2),
             "estimated_total_annual_cost": round(float(recommendation.annual_total_cost), 2),
+            "uncovered_drug_count": recommendation.uncovered_drug_count,
+            "restriction_summary": recommendation.restriction_summary,
             "cost_breakdown": {
                 "annual_premium": round(float(recommendation.annual_premium), 2),
                 "estimated_oop": round(float(recommendation.annual_drug_oop), 2),
@@ -308,6 +338,65 @@ def recommendations_to_dataframe(
         rows.append(row)
     frame = pd.DataFrame(rows)
     return frame[RECOMMENDATION_SCHEMA_COLUMNS + [col for col in frame.columns if col not in RECOMMENDATION_SCHEMA_COLUMNS]]
+
+
+def recommendation_bundle_to_dataframes(
+    bundle: RecommendationBundle,
+    *,
+    run_id: str | None = None,
+    minimum_coverage_pct: float = 0.0,
+) -> dict[str, pd.DataFrame]:
+    run_id = run_id or uuid.uuid4().hex[:12]
+    return {
+        "summary": pd.DataFrame([asdict(bundle.summary)], columns=BUNDLE_SUMMARY_COLUMNS),
+        "full_coverage_plans": recommendations_to_dataframe(
+            bundle.full_coverage_plans,
+            run_id=run_id,
+            comparison_only=False,
+            minimum_coverage_pct=minimum_coverage_pct,
+        ),
+        "partial_fallback_plans": recommendations_to_dataframe(
+            bundle.partial_fallback_plans,
+            run_id=run_id,
+            comparison_only=False,
+            minimum_coverage_pct=minimum_coverage_pct,
+        ),
+        "comparison_only_plans": recommendations_to_dataframe(
+            bundle.comparison_only_plans,
+            run_id=run_id,
+            comparison_only=True,
+            minimum_coverage_pct=minimum_coverage_pct,
+        ),
+        "blocked_medications": pd.DataFrame(
+            [asdict(item) for item in bundle.blocked_medications],
+            columns=BUNDLE_BLOCKED_COLUMNS,
+        ),
+        "alternative_search_terms": pd.DataFrame(
+            [asdict(item) for item in bundle.alternative_search_terms],
+            columns=BUNDLE_ALTERNATIVE_COLUMNS,
+        ),
+    }
+
+
+def recommendation_bundle_to_public_payload(
+    bundle: RecommendationBundle,
+    *,
+    run_id: str | None = None,
+    minimum_coverage_pct: float = 0.0,
+) -> dict:
+    frames = recommendation_bundle_to_dataframes(
+        bundle,
+        run_id=run_id,
+        minimum_coverage_pct=minimum_coverage_pct,
+    )
+    return {
+        "summary": asdict(bundle.summary),
+        "full_coverage_plans": frames["full_coverage_plans"].to_dict("records"),
+        "partial_fallback_plans": frames["partial_fallback_plans"].to_dict("records"),
+        "comparison_only_plans": frames["comparison_only_plans"].to_dict("records"),
+        "blocked_medications": frames["blocked_medications"].to_dict("records"),
+        "alternative_search_terms": frames["alternative_search_terms"].to_dict("records"),
+    }
 
 
 def summarize_feature_coverage(

@@ -15,7 +15,7 @@ from cms_mpd.modeling import (
     train_hybrid_reranker,
 )
 from cms_mpd.pipeline import build_database, health_check
-from cms_mpd.recommend import BeneficiaryInput, MedicationInput, recommend_plans
+from cms_mpd.recommend import BeneficiaryInput, MedicationInput, recommend_plan_bundle, recommend_plans
 
 
 def _write(path: Path, content: str) -> Path:
@@ -244,6 +244,16 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert recommendations[0].drug_breakdowns[0].coverage_gap_flag is False
     assert recommendations[1].drug_breakdowns[1].coverage_status == "excluded"
     assert recommendations[1].explanation_groups.coverage_issues
+
+    bundle = recommend_plan_bundle(beneficiary, medications, config=config)
+    assert bundle.summary.requested_drug_count == 2
+    assert bundle.summary.local_candidate_plan_count == 2
+    assert bundle.summary.local_full_coverage_count == 1
+    assert bundle.summary.local_partial_count == 1
+    assert bundle.summary.fallback_reason == "none"
+    assert [item.plan_name for item in bundle.full_coverage_plans] == ["Plan A"]
+    assert bundle.partial_fallback_plans == []
+    assert bundle.blocked_medications == []
 
     reversed_recommendations = recommend_plans(beneficiary, list(reversed(medications)), config=config)
     assert [item.plan_key for item in reversed_recommendations] == [item.plan_key for item in recommendations]

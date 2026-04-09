@@ -27,10 +27,14 @@ from cms_mpd.decision_support import (
     ProfileInput,
     as_public_types,
     create_run_audit,
+    recommendation_bundle_to_dataframes,
+    recommendation_bundle_to_public_payload,
     recommendations_to_dataframe,
     summarize_feature_coverage,
 )
 from cms_mpd.recommend import (
+    AlternativeSearchTerm,
+    BlockedMedication,
     DrugFillTrace,
     ExplanationItem,
     MedicationMatch,
@@ -39,6 +43,8 @@ from cms_mpd.recommend import (
     PlanExplanationGroups,
     PlanFitMetrics,
     PlanRecommendation,
+    RecommendationBundle,
+    RecommendationBundleSummary,
 )
 
 
@@ -654,3 +660,108 @@ def test_decision_support_exports_and_counselor_note():
     assert "stable pharmacy channel pattern" in note
     assert "comparison-only" in note
     assert any("Hybrid reranker score not available" in gap for gap in gaps)
+
+
+def test_recommendation_bundle_serializers_keep_grouped_sections():
+    full_recommendation = _sample_recommendation(
+        plan_key="H1000001000",
+        plan_name="Alpha Choice",
+        annual_total_cost=900.0,
+        annual_premium=360.0,
+        annual_drug_oop=540.0,
+    )
+    comparison_recommendation = _sample_recommendation(
+        plan_key="S2000001000",
+        plan_name="Beta Saver",
+        annual_total_cost=980.0,
+        annual_premium=420.0,
+        annual_drug_oop=560.0,
+        comparison_only=True,
+    )
+    bundle = RecommendationBundle(
+        summary=RecommendationBundleSummary(
+            requested_drug_count=2,
+            local_candidate_plan_count=7,
+            local_full_coverage_count=1,
+            local_partial_count=6,
+            fallback_reason="none",
+        ),
+        full_coverage_plans=[full_recommendation],
+        partial_fallback_plans=[],
+        comparison_only_plans=[comparison_recommendation],
+        blocked_medications=[
+            BlockedMedication(
+                medication_id="med_1",
+                requested_drug_name="insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+                resolved_drug_name="insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+                ndc="83257001111",
+                rxcui="2563977",
+                local_coverable_plan_count=0,
+                blocker_type="never_local_coverable",
+            )
+        ],
+        alternative_search_terms=[
+            AlternativeSearchTerm(
+                medication_id="med_1",
+                requested_drug_name="insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+                resolved_drug_name="insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+                search_term="insulin glargine-yfgn",
+            )
+        ],
+    )
+
+    frames = recommendation_bundle_to_dataframes(bundle, run_id="bundle123", minimum_coverage_pct=100.0)
+
+    assert frames["summary"].iloc[0]["local_full_coverage_count"] == 1
+    assert frames["full_coverage_plans"].iloc[0]["PLAN_KEY"] == "H1000001000"
+    assert bool(frames["comparison_only_plans"].iloc[0]["comparison_only"]) is True
+    assert frames["blocked_medications"].iloc[0]["blocker_type"] == "never_local_coverable"
+    assert frames["alternative_search_terms"].iloc[0]["search_term"] == "insulin glargine-yfgn"
+
+    payload = recommendation_bundle_to_public_payload(bundle, run_id="bundle123", minimum_coverage_pct=100.0)
+
+    assert payload["summary"]["fallback_reason"] == "none"
+    assert payload["full_coverage_plans"][0]["PLAN_NAME"] == "Alpha Choice"
+    assert payload["blocked_medications"][0]["medication_id"] == "med_1"
+
+
+def test_build_side_by_side_frame_includes_tradeoff_columns():
+    frame = recommendations_to_dataframe(
+        [
+            _sample_recommendation(
+                plan_key="H1000001000",
+                plan_name="Alpha Choice",
+                annual_total_cost=900.0,
+                annual_premium=360.0,
+                annual_drug_oop=540.0,
+            ),
+            _sample_recommendation(
+                plan_key="S2000001000",
+                plan_name="Beta Saver",
+                annual_total_cost=980.0,
+                annual_premium=420.0,
+                annual_drug_oop=560.0,
+                uncovered_drug_count=1,
+                restriction_count=1,
+                network_flag="limited_preferred_retail",
+            ),
+        ],
+        run_id="sidebyside",
+        minimum_coverage_pct=100.0,
+    )
+
+    side_by_side = build_side_by_side_frame(frame, ["H1000001000", "S2000001000"])
+    metrics = set(side_by_side["Metric"].tolist())
+
+    assert {
+        "Annual total cost",
+        "Annual premium",
+        "Annual drug OOP",
+        "Coverage percent",
+        "Uncovered drugs",
+        "Restriction summary",
+        "Network flag",
+        "Preferred distance",
+        "Channel mix",
+        "Channel switches",
+    }.issubset(metrics)

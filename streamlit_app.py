@@ -17,7 +17,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from cms_mpd import BeneficiaryInput, PipelineConfig, recommend_plans
+from cms_mpd import BeneficiaryInput, PipelineConfig, recommend_plan_bundle, recommend_plans
 from cms_mpd.app_support import (
     CHRONIC_FLAG_OPTIONS,
     DEFAULT_MEDICATION_ROWS,
@@ -49,6 +49,7 @@ from cms_mpd.decision_support import (
     ProfileInput,
     as_public_types,
     create_run_audit,
+    recommendation_bundle_to_dataframes,
     recommend_preference_preset,
     recommendations_to_dataframe,
     serialize_nested_columns,
@@ -545,6 +546,65 @@ def _render_metric_cards(frame: pd.DataFrame) -> None:
         )
 
 
+def _clear_result_state() -> None:
+    for key in [
+        "result_bundle",
+        "result_summary_df",
+        "result_df",
+        "full_result_df",
+        "partial_fallback_df",
+        "comparison_df",
+        "blocked_medications_df",
+        "alternative_search_terms_df",
+        "audit",
+        "public_contract",
+        "recommendations",
+        "full_coverage_recommendations",
+        "partial_fallback_recommendations",
+        "comparison_recommendations",
+        "counselor_note",
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state["what_if_runs"] = []
+    st.session_state["what_if_summary_df"] = pd.DataFrame()
+    st.session_state["what_if_note"] = ""
+    st.session_state["what_if_run_keys"] = []
+
+
+def _apply_catalog_alternative(
+    medication_id: str,
+    catalog_row: pd.Series,
+    *,
+    day_supply: int,
+    tier_family: str,
+) -> None:
+    try:
+        medication_index = int(str(medication_id).split("_")[-1]) - 1
+    except (TypeError, ValueError):
+        st.session_state["alternative_notice"] = "Could not map the blocked medication back to the editor row."
+        return
+
+    medication_rows = [dict(row) for row in st.session_state.get("medication_editor_rows", DEFAULT_MEDICATION_ROWS)]
+    if medication_index < 0 or medication_index >= len(medication_rows):
+        st.session_state["alternative_notice"] = "The blocked medication row is no longer available in the editor."
+        return
+
+    existing_row = medication_rows[medication_index]
+    replacement = build_medication_row_from_catalog(
+        catalog_row,
+        day_supply=day_supply,
+        tier_family=tier_family,
+    )
+    replacement["quantity_override"] = existing_row.get("quantity_override")
+    replacement["fills_per_year_override"] = existing_row.get("fills_per_year_override")
+    medication_rows[medication_index] = replacement
+    st.session_state["medication_editor_rows"] = medication_rows
+    st.session_state["alternative_notice"] = (
+        f"Updated {medication_id} to {replacement['drug_name']}. Run decision support again to rescore the shortlist."
+    )
+    _clear_result_state()
+
+
 def _render_monthly_timeline_charts(timeline_frame: pd.DataFrame) -> None:
     if timeline_frame.empty:
         return
@@ -776,6 +836,7 @@ def main() -> None:
         "medication_editor_seed": DEFAULT_MEDICATION_ROWS,
         "medication_editor_rows": DEFAULT_MEDICATION_ROWS,
         "medication_search_query": "",
+        "alternative_notice": "",
         "what_if_selected_scenarios": [],
         "what_if_run_keys": [],
         "what_if_runs": [],
@@ -833,6 +894,9 @@ def main() -> None:
     with meds_tab:
         st.subheader("2. Medications")
         st.caption("Capture drug name, RXCUI, or NDC. The closer this list is to the real regimen, the better the plan explanations will be.")
+        if st.session_state.get("alternative_notice"):
+            st.success(str(st.session_state.get("alternative_notice")))
+            st.session_state["alternative_notice"] = ""
         st.markdown("#### Search available drugs")
         st.caption("Search the system catalog and add a matched drug directly into the medication list.")
         drug_catalog = get_drug_catalog(str(config.db_path))
@@ -1003,40 +1067,66 @@ def main() -> None:
             else:
                 beneficiary = _beneficiary_from_contracts(profile_contract, preference_contract)
                 with st.spinner("Running recommendation engine and comparison workflow..."):
-                    recommendations = recommend_plans(
+                    bundle = recommend_plan_bundle(
                         beneficiary,
                         medications,
                         config=config,
                         ranking_mode=preference_contract.ranking_mode,
                     )
                     comparison_recs = []
-                    if preference_contract.allow_comparison_plans and recommendations:
+                    local_plan_keys = {
+                        row.plan_key
+                        for row in (bundle.full_coverage_plans + bundle.partial_fallback_plans)
+                    }
+                    if preference_contract.allow_comparison_plans and local_plan_keys:
                         comparison_recs = _comparison_recommendations(
                             config,
                             beneficiary,
                             medications,
                             max_distance_miles=preference_contract.max_comparison_distance_miles,
-                            local_plan_keys={row.plan_key for row in recommendations},
+                            local_plan_keys=local_plan_keys,
                         )
+                        bundle = replace(bundle, comparison_only_plans=comparison_recs[:5])
 
                 run_id = uuid.uuid4().hex[:12]
-                result_df = recommendations_to_dataframe(
-                    recommendations,
+                bundle_frames = recommendation_bundle_to_dataframes(
+                    bundle,
                     run_id=run_id,
-                    comparison_only=False,
                     minimum_coverage_pct=preference_contract.minimum_coverage_pct,
                 )
-                comparison_df = recommendations_to_dataframe(
-                    comparison_recs,
-                    run_id=run_id,
-                    comparison_only=True,
-                    minimum_coverage_pct=preference_contract.minimum_coverage_pct,
+                summary_df = bundle_frames["summary"]
+                full_result_df = bundle_frames["full_coverage_plans"]
+                partial_fallback_df = bundle_frames["partial_fallback_plans"]
+                comparison_df = bundle_frames["comparison_only_plans"]
+                blocked_medications_df = bundle_frames["blocked_medications"]
+                alternative_search_terms_df = bundle_frames["alternative_search_terms"]
+                local_result_df = (
+                    full_result_df if not full_result_df.empty else partial_fallback_df
                 )
-                feature_coverage = summarize_feature_coverage(recommendations, comparison_recs)
+                local_display_recommendations = (
+                    bundle.full_coverage_plans
+                    if bundle.full_coverage_plans
+                    else bundle.partial_fallback_plans
+                )
+                feature_coverage = summarize_feature_coverage(local_display_recommendations, comparison_recs)
+                feature_coverage["candidate_plans"] = int(bundle.summary.local_candidate_plan_count) + len(comparison_recs)
+                feature_coverage["eligible_plans"] = int(bundle.summary.local_candidate_plan_count)
+                feature_coverage["comparison_only_plans"] = len(comparison_recs)
+                feature_coverage["plans_with_full_coverage"] = int(bundle.summary.local_full_coverage_count)
                 public_contract = as_public_types(
                     profile_contract,
                     [MedicationListItem(**row) for row in st.session_state.get("medication_contract_rows", [])],
                     preference_contract,
+                )
+                combined_sections = [
+                    frame
+                    for frame in (full_result_df, partial_fallback_df, comparison_df)
+                    if frame is not None and not frame.empty
+                ]
+                combined_frame = (
+                    pd.concat(combined_sections, ignore_index=True)
+                    if combined_sections
+                    else pd.DataFrame()
                 )
                 audit = create_run_audit(
                     user_input_summary=public_contract,
@@ -1047,19 +1137,27 @@ def main() -> None:
                     ),
                     data_snapshot=config.snapshot_quarter,
                     feature_coverage=feature_coverage,
-                    recommendations=pd.concat([result_df, comparison_df], ignore_index=True),
+                    recommendations=combined_frame,
                     run_id=run_id,
                 )
-                st.session_state["result_df"] = result_df
+                st.session_state["result_bundle"] = bundle
+                st.session_state["result_summary_df"] = summary_df
+                st.session_state["result_df"] = local_result_df
+                st.session_state["full_result_df"] = full_result_df
+                st.session_state["partial_fallback_df"] = partial_fallback_df
                 st.session_state["comparison_df"] = comparison_df
+                st.session_state["blocked_medications_df"] = blocked_medications_df
+                st.session_state["alternative_search_terms_df"] = alternative_search_terms_df
                 st.session_state["audit"] = asdict(audit)
                 st.session_state["public_contract"] = public_contract
-                st.session_state["recommendations"] = recommendations
+                st.session_state["recommendations"] = local_display_recommendations
+                st.session_state["full_coverage_recommendations"] = bundle.full_coverage_plans
+                st.session_state["partial_fallback_recommendations"] = bundle.partial_fallback_plans
                 st.session_state["comparison_recommendations"] = comparison_recs
                 st.session_state["counselor_note"] = build_counselor_note(
                     profile_contract,
                     preference_contract,
-                    result_df,
+                    local_result_df,
                     comparison_df,
                 )
                 st.session_state["what_if_runs"] = []
@@ -1067,42 +1165,169 @@ def main() -> None:
                 st.session_state["what_if_note"] = ""
                 st.session_state["what_if_run_keys"] = []
 
-        result_df = st.session_state.get("result_df")
+        result_bundle = st.session_state.get("result_bundle")
+        result_summary_df = st.session_state.get("result_summary_df", pd.DataFrame())
+        result_df = st.session_state.get("result_df", pd.DataFrame())
+        full_result_df = st.session_state.get("full_result_df", pd.DataFrame())
+        partial_fallback_df = st.session_state.get("partial_fallback_df", pd.DataFrame())
         comparison_df = st.session_state.get("comparison_df", pd.DataFrame())
+        blocked_medications_df = st.session_state.get("blocked_medications_df", pd.DataFrame())
+        alternative_search_terms_df = st.session_state.get("alternative_search_terms_df", pd.DataFrame())
         audit = st.session_state.get("audit")
         public_contract = st.session_state.get("public_contract")
         recommendations = st.session_state.get("recommendations", [])
+        full_coverage_recommendations = st.session_state.get("full_coverage_recommendations", [])
+        partial_fallback_recommendations = st.session_state.get("partial_fallback_recommendations", [])
         comparison_recommendations = st.session_state.get("comparison_recommendations", [])
         counselor_note = st.session_state.get("counselor_note")
         current_profile_contract: ProfileInput | None = st.session_state.get("profile_contract")
         current_preference_contract: PreferenceWeights | None = st.session_state.get("preference_contract")
         current_medications = st.session_state.get("medications", [])
-        if result_df is None or result_df.empty:
+        if result_bundle is None:
             st.info("Complete the first three steps, then run decision support to generate a shortlist.")
             return
 
-        _render_metric_cards(result_df)
-        st.markdown("#### Eligible shortlist")
-        st.dataframe(result_df.head(10), use_container_width=True, hide_index=True)
+        if not result_df.empty:
+            _render_metric_cards(result_df)
+        if not result_summary_df.empty:
+            summary_row = result_summary_df.iloc[0]
+            if (
+                str(summary_row.get("fallback_reason") or "") == "no_local_full_coverage"
+                and int(summary_row.get("local_candidate_plan_count") or 0) > 0
+            ):
+                st.warning(
+                    "No local ZIP-eligible plan fully covers every entered drug exactly as entered. "
+                    "Showing the best local fallback plans and the exact blockers instead."
+                )
+            elif int(summary_row.get("local_candidate_plan_count") or 0) == 0:
+                st.warning("No local ZIP-eligible plans were found for the selected ZIP code.")
+
+        st.markdown("#### Local full-coverage plans")
+        if full_result_df.empty:
+            st.caption("No local full-coverage plans were found for the exact entered regimen.")
+        else:
+            st.dataframe(full_result_df.head(10), use_container_width=True, hide_index=True)
+
+        st.markdown("#### Best local fallback plans")
+        if partial_fallback_df.empty:
+            st.caption("Fallback plans are only shown when no local full-coverage plan exists.")
+        else:
+            st.dataframe(partial_fallback_df.head(10), use_container_width=True, hide_index=True)
+
         if not comparison_df.empty:
             st.markdown("#### Nearby comparison-only plans")
             st.dataframe(comparison_df.head(5), use_container_width=True, hide_index=True)
-        combined_frame = pd.concat([result_df, comparison_df], ignore_index=True)
-        plan_lookup = combined_frame.drop_duplicates("PLAN_KEY").set_index("PLAN_KEY")
-        default_compare = plan_lookup.index.tolist()[: min(3, len(plan_lookup))]
-        selected_plan_keys = st.multiselect(
-            "Choose plans for side-by-side comparison",
-            options=plan_lookup.index.tolist(),
-            default=default_compare,
-            format_func=lambda plan_key: (
-                f"{plan_lookup.loc[plan_key, 'PLAN_NAME']} "
-                f"({'comparison only' if bool(plan_lookup.loc[plan_key, 'comparison_only']) else 'eligible'})"
-            ),
+
+        st.markdown("#### Blocked exact drugs and alternative search")
+        if blocked_medications_df.empty:
+            st.caption("No blocked exact drugs were identified for the current local shortlist.")
+        else:
+            st.dataframe(blocked_medications_df, use_container_width=True, hide_index=True)
+            st.caption(
+                "Search seeds below are derived from the blocked exact products. Choosing an alternative updates "
+                "the medication list, but does not auto-substitute or rerun recommendations."
+            )
+            blocked_ndc_lookup = (
+                blocked_medications_df.set_index("medication_id")["ndc"].astype(str).to_dict()
+                if "medication_id" in blocked_medications_df.columns
+                else {}
+            )
+            drug_catalog = get_drug_catalog(str(config.db_path))
+            current_rows = [dict(row) for row in st.session_state.get("medication_editor_rows", DEFAULT_MEDICATION_ROWS)]
+            for alternative_row in alternative_search_terms_df.to_dict("records"):
+                medication_id = str(alternative_row.get("medication_id") or "")
+                search_term = str(alternative_row.get("search_term") or "").strip()
+                resolved_drug_name = str(alternative_row.get("resolved_drug_name") or medication_id)
+                st.markdown(f"**{resolved_drug_name}**")
+                st.caption(f"Suggested search seed: `{search_term}`")
+                search_matches = search_drug_catalog(drug_catalog, search_term, limit=10)
+                blocked_ndc = blocked_ndc_lookup.get(medication_id)
+                if blocked_ndc:
+                    search_matches = search_matches[
+                        search_matches["ndc"].fillna("").astype(str) != str(blocked_ndc)
+                    ].reset_index(drop=True)
+                if search_matches.empty:
+                    st.caption("No alternative products matched this search seed in the local drug catalog.")
+                    continue
+                option_labels = [format_drug_catalog_option(row) for _, row in search_matches.iterrows()]
+                selected_label = st.selectbox(
+                    f"Alternative products for {resolved_drug_name}",
+                    options=option_labels,
+                    key=f"alternative_picker_{medication_id}",
+                )
+                selected_row = search_matches.iloc[option_labels.index(selected_label)]
+                try:
+                    medication_index = int(medication_id.split("_")[-1]) - 1
+                except (TypeError, ValueError):
+                    medication_index = -1
+                existing_row = current_rows[medication_index] if 0 <= medication_index < len(current_rows) else {}
+                picker_cols = st.columns([1, 1, 1.2])
+                day_supply_options = catalog_available_day_supply_options(selected_row)
+                default_day_supply = int(existing_row.get("day_supply") or day_supply_options[0])
+                try:
+                    default_day_supply_index = day_supply_options.index(default_day_supply)
+                except ValueError:
+                    default_day_supply_index = 0
+                selected_day_supply = picker_cols[0].selectbox(
+                    "Day supply",
+                    options=day_supply_options,
+                    index=default_day_supply_index,
+                    key=f"alternative_day_supply_{medication_id}",
+                )
+                tier_family_options = catalog_tier_family_options(selected_row)
+                default_tier_family = (
+                    str(existing_row.get("tier_family") or selected_row.get("tier_family") or tier_family_options[0])
+                    .strip()
+                    .lower()
+                )
+                try:
+                    default_tier_family_index = tier_family_options.index(default_tier_family)
+                except ValueError:
+                    default_tier_family_index = 0
+                selected_tier_family = picker_cols[1].selectbox(
+                    "Tier family",
+                    options=tier_family_options,
+                    index=default_tier_family_index,
+                    key=f"alternative_tier_{medication_id}",
+                    disabled=len(tier_family_options) == 1,
+                )
+                if picker_cols[2].button(
+                    "Use selected alternative in medication list",
+                    key=f"apply_alternative_{medication_id}",
+                    use_container_width=True,
+                ):
+                    _apply_catalog_alternative(
+                        medication_id,
+                        selected_row,
+                        day_supply=int(selected_day_supply),
+                        tier_family=str(selected_tier_family),
+                    )
+                    st.rerun()
+
+        combined_sections = [
+            frame for frame in (full_result_df, partial_fallback_df, comparison_df) if not frame.empty
+        ]
+        combined_frame = (
+            pd.concat(combined_sections, ignore_index=True)
+            if combined_sections
+            else pd.DataFrame()
         )
-        side_by_side = build_side_by_side_frame(combined_frame, selected_plan_keys)
-        if not side_by_side.empty:
-            st.markdown("#### Side-by-side comparison")
-            st.dataframe(side_by_side, use_container_width=True, hide_index=True)
+        if not combined_frame.empty:
+            plan_lookup = combined_frame.drop_duplicates("PLAN_KEY").set_index("PLAN_KEY")
+            default_compare = plan_lookup.index.tolist()[: min(3, len(plan_lookup))]
+            selected_plan_keys = st.multiselect(
+                "Choose plans for side-by-side comparison",
+                options=plan_lookup.index.tolist(),
+                default=default_compare,
+                format_func=lambda plan_key: (
+                    f"{plan_lookup.loc[plan_key, 'PLAN_NAME']} "
+                    f"({'comparison only' if bool(plan_lookup.loc[plan_key, 'comparison_only']) else 'eligible'})"
+                ),
+            )
+            side_by_side = build_side_by_side_frame(combined_frame, selected_plan_keys)
+            if not side_by_side.empty:
+                st.markdown("#### Side-by-side comparison")
+                st.dataframe(side_by_side, use_container_width=True, hide_index=True)
 
         if counselor_note:
             st.markdown("#### Counselor note")
@@ -1123,23 +1348,29 @@ def main() -> None:
             for gap in evidence_gaps:
                 st.write(f"- {gap}")
 
-        st.markdown("#### Eligible plan details")
-        _render_plan_details(recommendations)
+        if full_coverage_recommendations:
+            st.markdown("#### Local full-coverage plan details")
+            _render_plan_details(full_coverage_recommendations)
+        if partial_fallback_recommendations:
+            st.markdown("#### Local fallback plan details")
+            _render_plan_details(partial_fallback_recommendations)
         if comparison_recommendations:
             st.markdown("#### Comparison-only plan details")
             _render_plan_details(comparison_recommendations)
-        st.download_button(
-            "Download recommendation report (CSV)",
-            data=serialize_nested_columns(combined_frame).to_csv(index=False),
-            file_name="cms_mpd_recommendations.csv",
-            mime="text/csv",
-        )
-        st.download_button(
-            "Download audit record (JSON)",
-            data=json.dumps(audit, indent=2),
-            file_name="cms_mpd_recommendation_audit.json",
-            mime="application/json",
-        )
+        if not combined_frame.empty:
+            st.download_button(
+                "Download recommendation report (CSV)",
+                data=serialize_nested_columns(combined_frame).to_csv(index=False),
+                file_name="cms_mpd_recommendations.csv",
+                mime="text/csv",
+            )
+        if audit is not None:
+            st.download_button(
+                "Download audit record (JSON)",
+                data=json.dumps(audit, indent=2),
+                file_name="cms_mpd_recommendation_audit.json",
+                mime="application/json",
+            )
         with st.expander("Structured input contract"):
             st.json(public_contract)
         with st.expander("Audit payload"):

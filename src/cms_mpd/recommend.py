@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -339,6 +340,44 @@ class PlanRecommendation:
     priced_drug_count: int = 0
     channel_switch_count: int = 0
     simulation_policy: str = SIMULATION_POLICY
+
+
+@dataclass(slots=True)
+class RecommendationBundleSummary:
+    requested_drug_count: int
+    local_candidate_plan_count: int
+    local_full_coverage_count: int
+    local_partial_count: int
+    fallback_reason: str
+
+
+@dataclass(slots=True)
+class BlockedMedication:
+    medication_id: str
+    requested_drug_name: str | None
+    resolved_drug_name: str
+    ndc: str
+    rxcui: str
+    local_coverable_plan_count: int
+    blocker_type: str
+
+
+@dataclass(slots=True)
+class AlternativeSearchTerm:
+    medication_id: str
+    requested_drug_name: str | None
+    resolved_drug_name: str
+    search_term: str
+
+
+@dataclass(slots=True)
+class RecommendationBundle:
+    summary: RecommendationBundleSummary
+    full_coverage_plans: list[PlanRecommendation]
+    partial_fallback_plans: list[PlanRecommendation]
+    comparison_only_plans: list[PlanRecommendation]
+    blocked_medications: list[BlockedMedication]
+    alternative_search_terms: list[AlternativeSearchTerm]
 
 
 def _normalize_days_supply(day_supply: int) -> int:
@@ -1507,6 +1546,132 @@ def _rules_ranking_sort_key(recommendation: PlanRecommendation) -> tuple[Any, ..
     )
 
 
+def _requested_drug_count(recommendation: PlanRecommendation) -> int:
+    return max(1, len(recommendation.drug_breakdowns))
+
+
+def _covered_and_priced_count(recommendation: PlanRecommendation) -> int:
+    return sum(
+        1
+        for item in recommendation.drug_breakdowns
+        if item.coverage_status == "covered" and item.pricing_status == "priced"
+    )
+
+
+def _coverage_pct_requested(recommendation: PlanRecommendation) -> float:
+    return round(100.0 * _covered_and_priced_count(recommendation) / _requested_drug_count(recommendation), 2)
+
+
+def _is_full_coverage_plan(recommendation: PlanRecommendation) -> bool:
+    return _covered_and_priced_count(recommendation) == _requested_drug_count(recommendation)
+
+
+def _distance_sort_value(value: float | None) -> float:
+    if value is None or pd.isna(value):
+        return float("inf")
+    return float(value)
+
+
+def _full_coverage_compare_sort_key(recommendation: PlanRecommendation) -> tuple[Any, ...]:
+    return (
+        float(recommendation.annual_total_cost),
+        float(recommendation.annual_drug_oop),
+        int(recommendation.restriction_count),
+        NETWORK_PRIORITY.get(recommendation.network_flag, 99),
+        _distance_sort_value(recommendation.nearest_preferred_distance_miles),
+        int(recommendation.channel_switch_count),
+        -float(recommendation.fit_score),
+        recommendation.plan_name,
+    )
+
+
+def _partial_fallback_sort_key(recommendation: PlanRecommendation) -> tuple[Any, ...]:
+    return (
+        -float(_coverage_pct_requested(recommendation)),
+        -int(recommendation.priced_drug_count),
+        float(recommendation.annual_total_cost),
+        int(recommendation.restriction_count),
+        NETWORK_PRIORITY.get(recommendation.network_flag, 99),
+        _distance_sort_value(recommendation.nearest_preferred_distance_miles),
+        -float(recommendation.fit_score),
+        recommendation.plan_name,
+    )
+
+
+def _assign_plan_ranks(recommendations: list[PlanRecommendation]) -> list[PlanRecommendation]:
+    for rank, recommendation in enumerate(recommendations, start=1):
+        recommendation.plan_rank = rank
+    return recommendations
+
+
+def _derive_alternative_search_seed(drug_name: str | None) -> str:
+    cleaned = re.sub(r"\[[^\]]*\]", "", str(drug_name or "")).strip()
+    if not cleaned:
+        return ""
+    tokens: list[str] = []
+    for token in cleaned.split():
+        if any(char.isdigit() for char in token):
+            break
+        tokens.append(token)
+    seed = " ".join(tokens).strip()
+    return seed or cleaned
+
+
+def _build_blocked_medications(recommendations: list[PlanRecommendation]) -> list[BlockedMedication]:
+    if not recommendations or any(_is_full_coverage_plan(item) for item in recommendations):
+        return []
+
+    requested_medications = recommendations[0].resolved_medications
+    local_coverable_counts = {item.medication_id: 0 for item in requested_medications}
+    for recommendation in recommendations:
+        coverable_ids = {
+            item.medication_id
+            for item in recommendation.drug_breakdowns
+            if item.coverage_status == "covered" and item.pricing_status == "priced"
+        }
+        for medication_id in coverable_ids:
+            if medication_id in local_coverable_counts:
+                local_coverable_counts[medication_id] += 1
+
+    blocked: list[BlockedMedication] = []
+    for match in requested_medications:
+        local_coverable_plan_count = int(local_coverable_counts.get(match.medication_id, 0))
+        blocker_type = (
+            "never_local_coverable" if local_coverable_plan_count == 0 else "not_jointly_coverable"
+        )
+        blocked.append(
+            BlockedMedication(
+                medication_id=match.medication_id,
+                requested_drug_name=match.requested_drug_name,
+                resolved_drug_name=match.resolved_drug_name,
+                ndc=match.ndc,
+                rxcui=match.rxcui,
+                local_coverable_plan_count=local_coverable_plan_count,
+                blocker_type=blocker_type,
+            )
+        )
+    return blocked
+
+
+def _build_alternative_search_terms(
+    blocked_medications: list[BlockedMedication],
+) -> list[AlternativeSearchTerm]:
+    search_terms: list[AlternativeSearchTerm] = []
+    for item in blocked_medications:
+        seed = _derive_alternative_search_seed(item.resolved_drug_name)
+        if not seed:
+            continue
+        search_terms.append(
+            AlternativeSearchTerm(
+                medication_id=item.medication_id,
+                requested_drug_name=item.requested_drug_name,
+                resolved_drug_name=item.resolved_drug_name,
+                search_term=seed,
+            )
+        )
+    return search_terms
+
+
 def _apply_fit_scoring(
     recommendations: list[PlanRecommendation],
     beneficiary: BeneficiaryInput,
@@ -1605,7 +1770,7 @@ def _apply_fit_scoring(
         recommendation.fit_summary = _build_fit_summary(recommendation, beneficiary)
 
 
-def recommend_plans(
+def _generate_recommendations(
     beneficiary: BeneficiaryInput,
     medications: list[MedicationInput],
     config: PipelineConfig | None = None,
@@ -2194,7 +2359,67 @@ def recommend_plans(
         recommendations = apply_hybrid_reranking(recommendations, beneficiary, config=active_config)
 
     conn.close()
+    return recommendations
+
+
+def recommend_plans(
+    beneficiary: BeneficiaryInput,
+    medications: list[MedicationInput],
+    config: PipelineConfig | None = None,
+    ranking_mode: str = "rules",
+) -> list[PlanRecommendation]:
+    recommendations = _generate_recommendations(
+        beneficiary,
+        medications,
+        config=config,
+        ranking_mode=ranking_mode,
+    )
     return recommendations[: max(1, beneficiary.top_n)]
+
+
+def recommend_plan_bundle(
+    beneficiary: BeneficiaryInput,
+    medications: list[MedicationInput],
+    config: PipelineConfig | None = None,
+    ranking_mode: str = "rules",
+    comparison_only_plans: list[PlanRecommendation] | None = None,
+) -> RecommendationBundle:
+    recommendations = _generate_recommendations(
+        beneficiary,
+        medications,
+        config=config,
+        ranking_mode=ranking_mode,
+    )
+    shortlist_limit = max(1, beneficiary.top_n)
+    full_coverage = sorted(
+        [item for item in recommendations if _is_full_coverage_plan(item)],
+        key=_full_coverage_compare_sort_key,
+    )
+    partial_fallback = sorted(
+        [item for item in recommendations if not _is_full_coverage_plan(item)],
+        key=_partial_fallback_sort_key,
+    )
+    displayed_full_coverage = _assign_plan_ranks(full_coverage[:shortlist_limit])
+    displayed_partial_fallback: list[PlanRecommendation] = []
+    if not full_coverage:
+        displayed_partial_fallback = _assign_plan_ranks(partial_fallback[:shortlist_limit])
+    blocked_medications = _build_blocked_medications(recommendations)
+    alternative_search_terms = _build_alternative_search_terms(blocked_medications)
+    displayed_comparison_plans = _assign_plan_ranks(list(comparison_only_plans or [])[:5])
+    return RecommendationBundle(
+        summary=RecommendationBundleSummary(
+            requested_drug_count=len(medications),
+            local_candidate_plan_count=len(recommendations),
+            local_full_coverage_count=len(full_coverage),
+            local_partial_count=len(partial_fallback),
+            fallback_reason="none" if full_coverage else "no_local_full_coverage",
+        ),
+        full_coverage_plans=displayed_full_coverage,
+        partial_fallback_plans=displayed_partial_fallback,
+        comparison_only_plans=displayed_comparison_plans,
+        blocked_medications=blocked_medications,
+        alternative_search_terms=alternative_search_terms,
+    )
 
 
 def recommendations_to_frame(recommendations: list[PlanRecommendation]) -> pd.DataFrame:

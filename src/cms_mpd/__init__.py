@@ -19,6 +19,8 @@ from .decision_support import (
     ProfileInput,
     RecommendationAudit,
     create_run_audit,
+    recommendation_bundle_to_dataframes,
+    recommendation_bundle_to_public_payload,
     recommendations_to_dataframe,
     summarize_feature_coverage,
 )
@@ -32,7 +34,9 @@ from .modeling import (
 )
 from .pipeline import build_database, extract_sources, health_check, run_pipeline
 from .recommend import (
+    AlternativeSearchTerm,
     BeneficiaryInput,
+    BlockedMedication,
     ExplanationItem,
     FillCostResult,
     DrugFillTrace,
@@ -43,6 +47,9 @@ from .recommend import (
     PlanExplanationGroups,
     PlanFitMetrics,
     PlanRecommendation,
+    RecommendationBundle,
+    RecommendationBundleSummary,
+    recommend_plan_bundle,
     recommend_plans,
     recommendations_to_comparison_frame,
     recommendations_to_frame,
@@ -57,7 +64,9 @@ from .research_eval import (
 )
 
 __all__ = [
+    "AlternativeSearchTerm",
     "BeneficiaryInput",
+    "BlockedMedication",
     "CHRONIC_FLAG_OPTIONS",
     "DEFAULT_MEDICATION_ROWS",
     "DrugFillTrace",
@@ -78,6 +87,8 @@ __all__ = [
     "PRIMARY_GOALS",
     "PreferenceWeights",
     "ProfileInput",
+    "RecommendationBundle",
+    "RecommendationBundleSummary",
     "ROLE_MAP",
     "RecommendationAudit",
     "apply_hybrid_reranking",
@@ -95,7 +106,10 @@ __all__ = [
     "health_check",
     "load_hybrid_reranker",
     "parse_medication_frame",
+    "recommend_plan_bundle",
     "recommend_plans",
+    "recommendation_bundle_to_dataframes",
+    "recommendation_bundle_to_public_payload",
     "recommendations_to_dataframe",
     "recommendations_to_comparison_frame",
     "recommendations_to_frame",

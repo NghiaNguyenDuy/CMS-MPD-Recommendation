@@ -7,9 +7,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .config import BENEFIT_DESIGN_MODES, PipelineConfig
+from .decision_support import recommendation_bundle_to_public_payload
 from .modeling import build_training_dataset, evaluate_hybrid_reranker, train_hybrid_reranker
 from .pipeline import health_check, run_pipeline
-from .recommend import BeneficiaryInput, MedicationInput, recommend_plans
+from .recommend import BeneficiaryInput, MedicationInput, recommend_plan_bundle, recommend_plans
 
 
 def _add_config_arguments(
@@ -90,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
     recommend.add_argument("--pharmacy-preference", default="auto", choices=["auto", "retail", "mail"])
     recommend.add_argument("--top-n", type=int, default=5)
     recommend.add_argument("--ranking-mode", default="rules", choices=["rules", "hybrid"])
+    recommend.add_argument(
+        "--shortlist-mode",
+        default="default",
+        choices=["default", "full_coverage_compare"],
+    )
     recommend.add_argument(
         "--user-role",
         default="beneficiary",
@@ -196,6 +202,24 @@ def main() -> None:
         user_role=args.user_role,
         decision_focus=args.decision_focus,
     )
+    if args.shortlist_mode == "full_coverage_compare":
+        bundle = recommend_plan_bundle(
+            beneficiary,
+            medications,
+            config=config,
+            ranking_mode=args.ranking_mode,
+        )
+        print(
+            json.dumps(
+                recommendation_bundle_to_public_payload(
+                    bundle,
+                    minimum_coverage_pct=100.0,
+                ),
+                indent=2,
+            )
+        )
+        return
+
     recommendations = recommend_plans(
         beneficiary,
         medications,

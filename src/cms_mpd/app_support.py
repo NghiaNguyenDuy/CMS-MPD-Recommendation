@@ -610,19 +610,22 @@ def build_side_by_side_frame(
         ("Recommendation tier", "recommendation_tier"),
         ("Eligibility", "eligibility_status"),
         ("Annual total cost", "estimated_total_annual_cost"),
-        ("Estimated annual OOP", "estimated_annual_oop"),
+        ("Annual premium", "annual_premium"),
+        ("Annual drug OOP", "annual_drug_oop"),
         ("Coverage percent", "coverage_pct_requested"),
         ("Coverage status", "coverage_status"),
+        ("Uncovered drugs", "uncovered_drug_count"),
         ("Priced medications", "priced_drug_count"),
-        ("Channel switches", "channel_switch_count"),
+        ("Restriction summary", "restriction_summary"),
+        ("Network flag", "network_flag"),
+        ("Preferred distance", "nearest_preferred_distance_miles"),
         ("Channel mix", "selected_channel_mix"),
+        ("Channel switches", "channel_switch_count"),
         ("Simulation policy", "simulation_policy"),
         ("Confidence", "confidence_band"),
         ("Decision score", "decision_score"),
         ("Rules score", "rules_score"),
         ("Ranking source", "ranking_source"),
-        ("Network flag", "network_flag"),
-        ("Preferred distance", "nearest_preferred_distance_miles"),
         ("Warnings", "warning_flags"),
         ("Evidence gaps", "evidence_gaps"),
     ]
@@ -633,7 +636,7 @@ def build_side_by_side_frame(
         for _, item in selected.iterrows():
             plan_name = str(item["PLAN_NAME"])
             value = item.get(column)
-            if column in {"estimated_total_annual_cost", "estimated_annual_oop"} and value is not None:
+            if column in {"estimated_total_annual_cost", "annual_premium", "annual_drug_oop"} and value is not None:
                 metric_row[plan_name] = f"${float(value):,.2f}"
             elif column == "coverage_pct_requested" and value is not None:
                 metric_row[plan_name] = f"{float(value):.1f}%"
@@ -641,7 +644,7 @@ def build_side_by_side_frame(
                 metric_row[plan_name] = f"{float(value):.1f}"
             elif column == "rules_score" and value is not None:
                 metric_row[plan_name] = f"{float(value):.2f}"
-            elif column in {"priced_drug_count", "channel_switch_count"} and value is not None:
+            elif column in {"uncovered_drug_count", "priced_drug_count", "channel_switch_count"} and value is not None:
                 metric_row[plan_name] = f"{int(value)}"
             elif column == "nearest_preferred_distance_miles":
                 metric_row[plan_name] = (
