@@ -9,8 +9,9 @@ tags:
   - project-review
   - methods
 created: 2026-04-07
-updated: 2026-04-08
+updated: 2026-04-10
 related_notes:
+  - "[[CMS MPD Recommendation - Data Lineage Table]]"
   - "[[CMS MPD Recommendation - Journal Manuscript Draft]]"
   - "[[CMS MPD Recommendation - Research Manuscript Draft]]"
   - "[[Source Index]]"
@@ -572,137 +573,269 @@ F_p \leftarrow
 \end{cases}
 $$
 
-## 5. Research Workflow
+## 5. Research Evaluation Workflow
 
-### 5.1 Scenario generation
-
-The project does not train on observed beneficiary-choice data. It creates recommendation scenarios from:
-
-1. `synthetic.*` tables when they exist;
-2. fallback scenario templates otherwise.
-
-The repository also supports PDE-compatible scenario generation through `scripts/generate_beneficiary_profiles.py`, which derives regimen-level defaults from PDE rows and maps them back to the formulary and RXCUI reference space.
-
-### 5.2 Training-dataset construction
-
-For each scenario, `modeling.py`:
-
-1. runs `recommend_plans(..., ranking_mode="rules")`;
-2. converts each returned plan into one feature row;
-3. enriches the row with `gold.recommendation_features`;
-4. computes weak-label and heuristic scores;
-5. computes within-scenario rank and relevance.
-
-This means the training dataset is not raw CMS data and not raw claims data. It is a replay dataset built from simulated recommendation outcomes.
-
-### 5.3 Weak labels and model families
-
-The current code declares:
-
-- dataset schema version `request_features_v4`
-- weak-label version `weak_label_v2`
-
-The weak-label target strongly rewards full coverage and penalizes higher annual total cost, uncovered drugs, exclusions, missing-price rows, channel-unavailable drugs, restrictions, approximate matches, mail dependency, insulin risk, and network risk.
-
-More formally:
+To assess whether hybrid reranking improves counselor-facing plan ordering without weakening medication safety, the study uses a replay-based evaluation workflow built on scenario-level recommendation outputs rather than observed beneficiary choices. Let $\mathcal{S}=\{s_1,\dots,s_N\}$ denote a set of beneficiary scenarios, where each scenario $s$ consists of a beneficiary profile and a medication regimen. For each scenario $s$, the rules-based recommendation engine is executed on the full set of ZIP-eligible plans, producing a plan set
 
 $$
-W_p =
-1000\,\mathbf{1}\{\text{coverage}_p=\text{full}\}
-+ R_p
-- T_p
-- 250U_p
-- 125E_p
-- 110M_p
-- 90C_p
-- 25H_p
-- 20A_p
-- 18Mail_p
-- 15Ins_p
-- 12InsNP_p
-- 20Net_p.
+\mathcal{P}_s=\{p_1,\dots,p_{M_s}\},
 $$
 
-The simpler heuristic baseline is:
+together with simulated annual cost, coverage, access, and utilization-management attributes for each candidate plan.
+
+### 5.1 Scenario construction
+
+The scenario pool is constructed from either synthetic beneficiary records or a deterministic benchmark generator. If the synthetic pool is sufficiently large, it is used directly; otherwise, the benchmark generator supplies a fixed set of scenario bundles spanning the main counseling situations the system is intended to support:
+
+- `low_generic`
+- `maintenance_brand`
+- `insulin_only`
+- `insulin_plus_chronic`
+- `specialty_high_cost`
+- `rural_access_sensitive`
+
+In the current rebuilt local state, the dataset is generated from the default benchmark pool and contains `300` scenarios.
+
+#### Dataset build sequence
+
+The training dataset is constructed by replaying the live recommendation engine over each scenario rather than by reading a pre-labeled table. Let $s \in \mathcal{S}$ denote one beneficiary-regimen scenario and let
 
 $$
-H_p^{heur} =
-500\,\mathbf{1}\{\text{coverage}_p=\text{full}\}
-+ R_p
-- T_p
-- 200U_p
-- 30H_p
-- 10Net_p.
+\mathcal{P}_s = \mathrm{Recommend}(s)
 $$
 
-The repository supports two reranker families:
+denote the ranked candidate-plan set returned by the rules engine for that scenario. In the implementation, benchmark scenarios are intentionally created with a large `top_n` so that the replay captures a deep local candidate set rather than only a short user-facing shortlist.
 
-- a transparent linear reranker based on ridge regression over encoded features;
-- a small additive regression-tree ensemble that captures non-linear interactions.
-
-### 5.4 Hybrid safety constraint
-
-The ML layer is not free to reorder the whole candidate set. Hybrid inference first separates plans into coverage-oriented buckets, then reranks only within those buckets. This is one of the most important safety decisions in the codebase because it prevents a learned score from overriding the primary coverage hierarchy.
-
-If $\hat{W}_p$ is the model score, the hybrid ranking is:
+The construction operator can therefore be written as
 
 $$
-\pi_{\text{hybrid}} =
+\mathcal{D}
+=
+\bigcup_{s \in \mathcal{S}}
+\bigcup_{p \in \mathcal{P}_s}
+\left\{
+\left(
+\mathbf{x}_{s,p},
+\tilde{y}_{s,p},
+\mathrm{rel}_{s,p}
+\right)
+\right\},
+$$
+
+where each tuple is created in four steps:
+
+1. build a beneficiary profile and medication list for scenario $s$;
+2. execute `recommend_plans(...)` in rules mode on the ZIP-eligible candidate set for $s$;
+3. flatten each returned `PlanRecommendation` into one scenario-plan feature row $\mathbf{x}_{s,p}$;
+4. compute the weak supervisory score $\tilde{y}_{s,p}$ and scenario-local relevance label $\mathrm{rel}_{s,p}$.
+
+This means the dataset grain is not beneficiary-level and not drug-level. The grain is:
+
+$$
+\text{one row} = (\text{scenario } s,\ \text{candidate plan } p).
+$$
+
+Methodologically, this choice matters because the reranker is being trained to reorder plans within a beneficiary-specific choice set. It is not being trained to predict an absolute plan-quality label in isolation from the scenario that generated it.
+
+### 5.2 Feature-row construction
+
+For each scenario-plan pair $(s,p)$, the recommendation output is converted into a feature vector
+
+$$
+\mathbf{x}_{s,p}=\phi(s,p),
+$$
+
+where $\phi(\cdot)$ summarizes the simulated recommendation result into structured model features. These include:
+
+- cost features such as annual premium, annual drug out-of-pocket cost, annual total cost, deductible exposure, and LIS-adjusted out-of-pocket cost;
+- coverage features such as covered share, uncovered-drug count, priced-drug share, exclusion burden, and missing-price burden;
+- access and stability features such as network risk score, preferred-pharmacy counts, distance bucket, channel-switch count, mail-order dependency, and insulin nonpreferred-channel dependency;
+- scenario-safety descriptors such as `scenario_bundle`, `scenario_profile`, `fallback_group`, `match_review_required_flag`, `unknown_network_data_flag`, and `unsafe_reason_count`.
+
+Operationally, the feature-row constructor merges four information sources into the same row:
+
+1. runtime simulation outputs from `recommend.py`, including annual cost, coverage status, channel choice, and fill-trace summaries;
+2. plan-level features from `gold.recommendation_features`, such as formulary burden, pharmacy counts, deductible, and served-county breadth;
+3. beneficiary attributes from the scenario definition, such as LIS status, age band, chronic-condition count, and pharmacy preference;
+4. ZIP-context features from `silver.dim_zipcode`, particularly density category and its derived numeric score.
+
+Thus, if $\psi(p)$ denotes plan-level serving features, $\beta(s)$ denotes beneficiary descriptors, and $\zeta(s)$ denotes ZIP-context descriptors, then the row-construction map can be summarized as
+
+$$
+\mathbf{x}_{s,p}
+=
+\phi(s,p)
+=
+g\!\left(
+\mathrm{Simulate}(s,p),\,
+\psi(p),\,
+\beta(s),\,
+\zeta(s)
+\right).
+$$
+
+Thus, the training dataset is neither raw CMS source data nor raw claims data. It is a replay dataset built from simulated recommendation outcomes.
+
+### 5.3 Weak-label target
+
+Because no observed ground-truth label exists for the "best" plan in each scenario, the study defines a weak supervisory target. For each $(s,p)$, a weak-label score $\tilde{y}_{s,p}$ is computed as
+
+$$
+\tilde{y}_{s,p}
+=
+\beta_0 \mathbf{1}\{c_{s,p}=\mathrm{full}\}
++ R_{s,p}
+- T_{s,p}
+- \lambda_1 U_{s,p}
+- \lambda_2 E_{s,p}
+- \lambda_3 M_{s,p}
+- \lambda_4 C_{s,p}
+- \lambda_5 H_{s,p}
+- \lambda_6 A_{s,p},
+$$
+
+where $c_{s,p}$ is coverage status, $R_{s,p}$ is the original rules score, $T_{s,p}$ is annual total cost, $U_{s,p}$ is uncovered-drug burden, $E_{s,p}$ is exclusion burden, $M_{s,p}$ is missing-price burden, $C_{s,p}$ is channel-unavailable burden, $H_{s,p}$ captures additional friction terms such as utilization-management restrictions and approximate matching, and $A_{s,p}$ captures access and network penalties. In the implementation, full coverage receives a large positive bonus so that medication safety dominates secondary tradeoffs.
+
+A simpler heuristic baseline is also defined:
+
+$$
+h_{s,p}
+=
+\gamma_0 \mathbf{1}\{c_{s,p}=\mathrm{full}\}
++ R_{s,p}
+- T_{s,p}
+- \eta_1 U_{s,p}
+- \eta_2 H_{s,p}
+- \eta_3 A_{s,p}.
+$$
+
+Plans are then ordered within each scenario by $\tilde{y}_{s,p}$, and a graded relevance label is assigned from the weak-label rank:
+
+$$
+\mathrm{rel}_{s,p}=\max(0,\,6-\mathrm{rank}_{\tilde{y}}(s,p)).
+$$
+
+This relevance mapping supports rank-based evaluation metrics while preserving within-scenario structure.
+
+### 5.4 Model fitting
+
+The training dataset is
+
+$$
+\mathcal{D}=\{(\mathbf{x}_{s,p},\tilde{y}_{s,p},\mathrm{rel}_{s,p}) : s\in\mathcal{S},\, p\in\mathcal{P}_s\}.
+$$
+
+Two reranker families are fitted:
+
+- a linear ridge-regression model over encoded numeric and categorical features;
+- a small additive tree ensemble that captures non-linear interactions.
+
+Both models are trained to predict $\tilde{y}_{s,p}$ from $\mathbf{x}_{s,p}$. The saved artifact stores the feature schema, weak-label version, dataset schema version, feature version, and training metadata so that the learned model remains traceable to the exact dataset configuration used at fit time.
+
+### 5.5 Held-out-by-scenario evaluation
+
+Evaluation uses a scenario-level split rather than a row-level split. Formally, the scenario set is partitioned into disjoint training and test subsets,
+
+$$
+\mathcal{S}=\mathcal{S}_{\mathrm{train}} \cup \mathcal{S}_{\mathrm{test}},
+\qquad
+\mathcal{S}_{\mathrm{train}} \cap \mathcal{S}_{\mathrm{test}}=\varnothing,
+$$
+
+so that all plan rows belonging to a given beneficiary scenario appear in only one split. This reduces leakage and better measures generalization to unseen counseling cases. The current implementation uses seed `42` and test fraction `0.3`.
+
+For each held-out scenario $s \in \mathcal{S}_{\mathrm{test}}$, the study compares:
+
+- `rules_only`
+- `heuristic_baseline`
+- `linear_reranker`
+- `tree_reranker`
+- feature-ablation variants
+
+Let $\pi_s^{(m)}$ denote the ranking induced by method $m$, and let $\pi_s^\star$ denote the weak-label reference ranking. Performance is summarized by top-$k$ overlap,
+
+$$
+\mathrm{Overlap}_k(\pi_s^{(m)},\pi_s^\star)
+=
+\frac{\left|\mathrm{Top}_k(\pi_s^{(m)})\cap \mathrm{Top}_k(\pi_s^\star)\right|}{\min(k, |\pi_s^\star|)},
+$$
+
+and normalized discounted cumulative gain,
+
+$$
+\mathrm{NDCG}@k
+=
+\frac{\mathrm{DCG}@k}{\mathrm{IDCG}@k},
+\qquad
+\mathrm{DCG}@k
+=
+\sum_{i=1}^{k}
+\frac{2^{\mathrm{rel}_{s,\pi_i^{(m)}}}-1}{\log_2(i+1)}.
+$$
+
+The evaluation also reports operational safety metrics, including:
+
+- top-1, top-5, and top-10 full-coverage rates;
+- average total cost in the top-ranked plans;
+- average uncovered-drug burden in the top-ranked plans;
+- blocker-classification precision;
+- match-review trigger rate;
+- plans dropped due to missing data;
+- the proportion of scenarios that include plans labeled with unknown network status.
+
+### 5.6 Hybrid safety constraint
+
+The learned model is not allowed to reorder plans across safety buckets. If $\hat{y}_{s,p}$ is the model-predicted weak-label score and $\mathcal{B}_0$, $\mathcal{B}_1$, and $\mathcal{B}_2$ denote the fully priceable, partially priceable, and fallback buckets, the deployed hybrid ranking is
+
+$$
+\pi_{\mathrm{hybrid}}
+=
 \bigcup_{b \in \{0,1,2\}}
 \operatorname{sort}_{p \in \mathcal{B}_b}
 \left(
--\hat{W}_p,
--n_p^{priced},
--R_p,
-T_p,
-U_p,
-H_p,
-\text{name}_p
-\right),
+-\hat{y}_{s,p},
+-n_{s,p}^{\mathrm{priced}},
+-R_{s,p},
+T_{s,p},
+U_{s,p},
+H_{s,p},
+\mathrm{name}_p
+\right).
 $$
 
-where $\mathcal{B}_0$, $\mathcal{B}_1$, and $\mathcal{B}_2$ are the full-priceable, partially priceable, and fallback buckets respectively.
-
-### 5.5 Evaluation design
-
-Evaluation uses a held-out-by-scenario split rather than a random row split. That is methodologically stronger because all rows from one scenario stay together in either train or test.
-
-Reported metrics include:
-
-- top-1 agreement
-- top-5 overlap
-- top-10 overlap
-- NDCG@5 and NDCG@10
-- top-5 and top-10 full-coverage rate
-- top-5 and top-10 average total cost
-- top-5 average uncovered-drug count
-
-Acceptance checks are intentionally simple:
-
-- top-5 overlap should not worsen;
-- top-10 overlap should not worsen;
-- top-5 uncovered burden should not worsen.
+Thus, machine learning acts as a constrained reranker rather than a replacement for the rules engine. The research question is whether reranking improves ordering within admissible safety sets, not whether it can override the primary coverage logic.
 
 ## 6. Current Artifact State and Reproducibility
 
-The checked-in evaluation JSON reports:
+The local rebuilt artifact state is now synchronized with the current code path:
 
-- `1774` dataset rows
-- `32` scenarios
-- `22` training scenarios
-- `10` test scenarios
-- held-out evaluation with seed `42` and test fraction `0.3`
+- dataset schema version: `request_features_v4`
+- weak-label version: `weak_label_v2`
+- feature version: `research_v4`
+- dataset rows: `16116`
+- scenario count: `300`
+- scenario source: `default`
+- scenario bundles:
+  - `low_generic`
+  - `maintenance_brand`
+  - `insulin_only`
+  - `insulin_plus_chronic`
+  - `specialty_high_cost`
+  - `rural_access_sensitive`
 
-Reported system means are:
+The refreshed evaluation report currently indicates:
 
-| System | Top-1 | Top-5 overlap | Top-10 overlap | NDCG@5 | Top-5 avg uncovered |
-| --- | --- | --- | --- | --- | --- |
-| `rules_only` | `0.60` | `0.98` | `0.88` | `0.893` | `0.10` |
-| `heuristic_baseline` | `0.70` | `1.00` | `0.91` | `0.912` | `0.10` |
-| `linear_reranker` | `0.80` | `0.88` | `0.88` | `0.924` | `0.10` |
-| `tree_reranker` | `1.00` | `1.00` | `0.97` | `1.000` | `0.10` |
+- `top5_improved = true`
+- `top10_improved = true`
+- `uncovered_not_worse = true`
 
-One reproducibility caveat matters. The evaluation JSON already reports `request_features_v4`, but the checked-in dataset metadata file still reports older markers such as `request_features_v2` and `research_v2`. The pipeline is conceptually coherent, but strict artifact reproducibility still depends on regenerating the training outputs from the current code path.
+One interpretation note remains important. The current report may show
+
+$$
+\mathrm{pct\_runs\_with\_unknown\_network\_data}=1.0,
+$$
+
+but this no longer indicates missing network-summary rows in the rebuilt database. It now means that at least one evaluated candidate plan in many scenarios is legitimately assigned `network_flag = 'unknown'` as a modeled access state.
 
 ## 7. How To Describe This Study In Manuscripts
 
@@ -832,3 +965,131 @@ Using the current DuckDB build and ZIP `43004`:
   - plus `rosuvastatin calcium 10 MG Oral Tablet`
   - returned `6` local full-coverage plans, with the top shortlist beginning with Wellcare plans.
 
+## Implementation Sync - 2026-04-09
+
+This note now also reflects the scenario-precise recommendation pass implemented on April 9, 2026.
+
+### What Was Added
+
+- Candidate-plan selection now keeps ZIP-eligible plans even when pharmacy-network summary rows are missing, and marks those plans as `unknown` rather than dropping them from runtime comparison.
+- Drug resolution now follows a reviewed-candidate workflow:
+  - `resolve_drug_candidates(...)` produces scored candidates;
+  - exact NDC and exact RXCUI remain authoritative;
+  - ambiguous name-only input now stops final ranking and requires manual review instead of silently choosing a loose match.
+- Each recommendation now carries:
+  - `scenario_profile`
+  - `match_review_required`
+  - `unsafe_reasons`
+- The scenario profile is assigned deterministically before final compare ordering and currently includes:
+  - `low_utilizer`
+  - `maintenance_generic`
+  - `insulin_chronic`
+  - `specialty_high_cost`
+  - `mixed_restriction`
+  - `access_sensitive`
+
+### Scenario-Aware Interpretation
+
+The implemented compare flow is no longer only cost-first in a generic sense. It now treats plan comparison as a safety-gated counseling workflow:
+
+1. ZIP-eligible local plans are enumerated.
+2. Medication identity is resolved with reviewed candidates.
+3. Exact-regimen full coverage is checked.
+4. Network and access uncertainty are surfaced as explicit warnings rather than silent exclusions.
+5. Scenario-specific tie-breaking is applied only inside the safe comparison set.
+
+In practical terms, this means:
+
+- specialty and high-cost regimens are ordered with more weight on utilization-management burden and continuity;
+- insulin regimens emphasize insulin channel stability and drug out-of-pocket exposure;
+- access-sensitive cases emphasize network confidence and distance before secondary cost tradeoffs.
+
+### Alternative Product Workflow
+
+Blocked-drug alternatives now behave more conservatively and more precisely:
+
+- search seeds are derived from resolved product names after removing bracketed brand text, strength tokens, and dose-form suffixes;
+- alternative product suggestions are ranked by insulin consistency, route consistency, RXCUI closeness, local plan coverage, and day-supply compatibility;
+- the counselor must explicitly apply the selected alternative before rerunning recommendation logic.
+
+### Data And Evaluation Sync
+
+The modeling workflow now reflects the same implementation assumptions:
+
+- the default benchmark generator was reworked into six scenario bundles:
+  - `low_generic`
+  - `maintenance_brand`
+  - `insulin_only`
+  - `insulin_plus_chronic`
+  - `specialty_high_cost`
+  - `rural_access_sensitive`
+- feature rows now capture scenario profile, match-review flags, unknown-network flags, unsafe-reason counts, and candidate-plan counts;
+- evaluation summaries now report scenario-sensitive outcomes such as full-coverage rates, blocker-classification precision proxy, match-review trigger rate, and runs affected by unknown network data.
+
+### Rebuilt Artifact State
+
+The local DuckDB artifact, training dataset, and reranker artifacts were rebuilt on April 9, 2026 from the staged `2025-Q3` raw files under `data/staging/`.
+
+#### Database rebuild status
+
+The rebuilt `data/cms_mpd.duckdb` now matches the current pipeline assumptions:
+
+- `health_check()` now returns `ok = true`;
+- `gold.plan_summary`, `gold.plan_network_summary`, `gold.plan_channel_summary`, and `gold.recommendation_features` each cover `5631` distinct plans;
+- plans missing `gold.plan_network_summary` rows dropped from `531` to `0`;
+- `gold.recommendation_features` now has `0` rows with null `network_flag`;
+- ZIP runtime candidate completeness is now exact, with `0` mismatched ZIP codes;
+- `silver.fact_plan_pharmacy` is now materialized as a base table rather than a view.
+
+The remaining `gold.plan_formulary_summary` versus `gold.plan_summary` delta of `40` plans is still reported for visibility, but it is not treated as a missing-data failure in the current health-check contract.
+
+#### Training dataset sync
+
+The training dataset was rebuilt after the database refresh and is now aligned with the current code:
+
+- dataset schema: `request_features_v4`
+- feature version: `research_v4`
+- row count: `16116`
+- scenario count: `300`
+- scenario source: `default`
+
+The rebuilt benchmark bundles are:
+
+- `low_generic`
+- `maintenance_brand`
+- `insulin_only`
+- `insulin_plus_chronic`
+- `specialty_high_cost`
+- `rural_access_sensitive`
+
+This means `data/training/2025-Q3/full/` is no longer carrying the earlier `request_features_v2` mismatch that existed before the rebuild.
+
+#### Model artifact sync
+
+Both reranker artifacts were retrained against the rebuilt dataset:
+
+- `data/models/2025-Q3/full/hybrid_reranker_linear.json`
+- `data/models/2025-Q3/full/hybrid_reranker_tree.json`
+
+Both artifacts now report:
+
+- dataset schema: `request_features_v4`
+- feature version: `research_v4`
+- training rows: `16116`
+- scenario count: `300`
+
+The evaluation report in `data/training/2025-Q3/full/hybrid_reranker_evaluation_tree.json` was also refreshed from the rebuilt dataset and new artifacts.
+
+#### Evaluation interpretation note
+
+The refreshed evaluation report shows:
+
+- `top5_improved = true`
+- `top10_improved = true`
+- `uncovered_not_worse = true`
+
+One metric still needs careful interpretation:
+
+- `pct_runs_with_unknown_network_data = 1.0`
+
+In the rebuilt state, this no longer means network-summary rows are missing. It now means at least one plan in many evaluated scenarios is legitimately labeled with `network_flag = 'unknown'` as a modeled access state, not that the underlying plan was dropped or left null by the pipeline.

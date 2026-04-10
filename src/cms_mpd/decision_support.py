@@ -36,6 +36,9 @@ RECOMMENDATION_SCHEMA_COLUMNS = [
     "rules_score",
     "ml_score",
     "ranking_source",
+    "scenario_profile",
+    "match_review_required",
+    "unsafe_reasons",
     "confidence_band",
     "confidence_score",
     "stability_score",
@@ -53,6 +56,10 @@ BUNDLE_SUMMARY_COLUMNS = [
     "local_full_coverage_count",
     "local_partial_count",
     "fallback_reason",
+    "scenario_profile",
+    "candidate_plan_count_service_area",
+    "candidate_plan_count_ranked",
+    "plans_with_unknown_network_count",
 ]
 BUNDLE_BLOCKED_COLUMNS = [
     "medication_id",
@@ -181,6 +188,7 @@ def _access_summary(recommendation: PlanRecommendation, comparison_only: bool) -
         "channel_diversity_count": recommendation.channel_diversity_count,
         "channel_switch_count": recommendation.channel_switch_count,
         "channel_mix": recommendation.best_channel_mix,
+        "scenario_profile": recommendation.scenario_profile,
     }
 
 
@@ -192,8 +200,12 @@ def _warning_flags(recommendation: PlanRecommendation, comparison_only: bool) ->
         warnings.append("Preferred retail access is limited.")
     elif recommendation.network_flag == "no_preferred_retail":
         warnings.append("No preferred retail access was identified.")
+    elif recommendation.network_flag == "unknown":
+        warnings.append("Pharmacy network data is incomplete for this plan.")
     if recommendation.uncovered_drug_count > 0:
         warnings.append("At least one requested drug is not fully covered.")
+    if recommendation.match_review_required:
+        warnings.append("At least one medication match should be reviewed before final use.")
     deduped: list[str] = []
     for warning in warnings:
         if warning and warning not in deduped:
@@ -215,6 +227,8 @@ def _evidence_gaps(recommendation: PlanRecommendation, comparison_only: bool) ->
         gaps.append(
             f"Only {recommendation.priced_drug_count} of {requested_count} entered medication(s) were fully priceable."
         )
+    if recommendation.match_review_required:
+        gaps.append("Medication resolution needs manual review before the shortlist should be treated as final.")
     if recommendation.nearest_preferred_distance_miles is None:
         gaps.append("Nearest preferred pharmacy distance is not available.")
     if comparison_only:
@@ -225,7 +239,7 @@ def _evidence_gaps(recommendation: PlanRecommendation, comparison_only: bool) ->
 def classify_confidence_band(recommendation: PlanRecommendation, comparison_only: bool = False) -> str:
     if comparison_only:
         return "Exploratory"
-    if recommendation.uncovered_drug_count > 0 or recommendation.network_flag == "no_preferred_retail":
+    if recommendation.uncovered_drug_count > 0 or recommendation.network_flag in {"no_preferred_retail", "unknown"}:
         return "Low"
     approximate_matches = sum(
         1 for item in recommendation.resolved_medications if item.match_confidence != "exact"
@@ -321,6 +335,9 @@ def recommendations_to_dataframe(
             "rules_score": round(float(recommendation.rules_score), 4),
             "ml_score": recommendation.model_score,
             "ranking_source": recommendation.ranking_source,
+            "scenario_profile": recommendation.scenario_profile,
+            "match_review_required": recommendation.match_review_required,
+            "unsafe_reasons": list(recommendation.unsafe_reasons),
             "confidence_band": confidence_band,
             "confidence_score": CONFIDENCE_SCORE_MAP[confidence_band],
             "stability_score": round(float(recommendation.fit_metrics.stability_score), 2),
@@ -413,10 +430,12 @@ def summarize_feature_coverage(
         "plans_with_distance": sum(
             1 for item in all_recommendations if item.nearest_preferred_distance_miles is not None
         ),
+        "plans_with_unknown_network_data": sum(1 for item in all_recommendations if item.network_flag == "unknown"),
         "plans_with_full_coverage": sum(1 for item in eligible_recommendations if item.coverage_status == "full"),
         "contract_years": sorted({int(item.contract_year) for item in all_recommendations if item.contract_year is not None}),
         "benefit_designs": sorted({str(item.benefit_design) for item in all_recommendations if item.benefit_design}),
         "simulation_policies": sorted({str(item.simulation_policy) for item in all_recommendations if item.simulation_policy}),
+        "scenario_profiles": sorted({str(item.scenario_profile) for item in all_recommendations if item.scenario_profile}),
     }
 
 
@@ -455,6 +474,9 @@ def create_run_audit(
             "decision_score",
             "rules_score",
             "ml_score",
+            "scenario_profile",
+            "match_review_required",
+            "unsafe_reasons",
             "confidence_band",
             "stability_score",
             "contract_year",

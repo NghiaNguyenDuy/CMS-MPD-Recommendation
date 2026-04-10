@@ -67,6 +67,13 @@ FOCUS_MAP = {
     "Easiest pharmacy access": "pharmacy_access",
     "Conservative compare and verify": "low_friction",
 }
+ROUTE_SIGNATURE_KEYWORDS = {
+    "injectable": ("injectable", "injection", "inject", "pen"),
+    "tablet_capsule": ("tablet", "capsule", "caplet"),
+    "solution_suspension": ("solution", "suspension", "liquid", "syrup"),
+    "inhalation": ("inhalation", "inhaler", "nebulizer", "powder"),
+    "topical": ("cream", "ointment", "gel", "lotion", "patch"),
+}
 
 
 @dataclass(frozen=True)
@@ -263,6 +270,52 @@ def search_drug_catalog(
     else:
         working = working.sort_values(["plan_coverage", "drug_name", "ndc"], ascending=[False, True, True])
     return working.head(max(1, int(limit))).drop(columns="_match_score", errors="ignore").reset_index(drop=True)
+
+
+def infer_route_signature(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    for signature, keywords in ROUTE_SIGNATURE_KEYWORDS.items():
+        if any(keyword in normalized for keyword in keywords):
+            return signature
+    return "unknown"
+
+
+def rank_alternative_matches(
+    matches: pd.DataFrame,
+    *,
+    blocked_drug_name: str | None,
+    current_row: dict | pd.Series | None = None,
+    blocked_rxcui: str | None = None,
+    limit: int = 10,
+) -> pd.DataFrame:
+    if matches.empty:
+        return matches.copy()
+    current_values = current_row if isinstance(current_row, dict) else (current_row.to_dict() if current_row is not None else {})
+    working = matches.copy()
+    blocked_route = infer_route_signature(blocked_drug_name or current_values.get("drug_name"))
+    blocked_day_supply = int(current_values.get("day_supply") or 30)
+    blocked_tier_family = str(current_values.get("tier_family") or "").strip().lower()
+    blocked_is_insulin = blocked_tier_family == "brand" and "insulin" in str(blocked_drug_name or "").lower()
+    if "is_insulin" in working.columns:
+        working["_same_insulin"] = (working["is_insulin"].fillna(False).astype(bool) == bool(blocked_is_insulin)).astype(int)
+    else:
+        working["_same_insulin"] = 0
+    working["_same_route"] = working["drug_name"].apply(lambda value: int(infer_route_signature(value) == blocked_route))
+    working["_same_rxcui"] = (
+        working["rxcui"].fillna("").astype(str).eq(str(blocked_rxcui or current_values.get("rxcui") or ""))
+    ).astype(int)
+    working["_matching_day_supply"] = working.apply(
+        lambda row: int(blocked_day_supply in catalog_available_day_supply_options(row)),
+        axis=1,
+    )
+    working = working.sort_values(
+        ["_same_insulin", "_same_route", "_same_rxcui", "plan_coverage", "_matching_day_supply", "drug_name", "ndc"],
+        ascending=[False, False, False, False, False, True, True],
+    )
+    return working.head(max(1, int(limit))).drop(
+        columns=["_same_insulin", "_same_route", "_same_rxcui", "_matching_day_supply"],
+        errors="ignore",
+    ).reset_index(drop=True)
 
 
 def format_drug_catalog_option(row: pd.Series | dict) -> str:
@@ -748,7 +801,9 @@ __all__ = [
     "coerce_zipcode",
     "format_drug_catalog_option",
     "haversine_miles",
+    "infer_route_signature",
     "parse_medication_frame",
+    "rank_alternative_matches",
     "search_drug_catalog",
     "summarize_drug_channel_path",
     "summarize_evidence_gaps",

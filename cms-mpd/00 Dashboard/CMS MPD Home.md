@@ -17,6 +17,10 @@ This vault separates raw imports, reviewed source notes, and stable topic knowle
 > 2. Create a reviewed note in `02 Source Notes` with [[Article Note Template]] or [[Reference Note Template]].
 > 3. Distill lasting knowledge into `03 Topic Notes` with [[Topic Note Template]].
 
+> [!tip] Working Convention
+> When repository implementation work is active, treat the `cms-mpd/` vault as the project knowledge base.
+> Start from [[CMS MPD Home]] and [[CMS MPD Recommendation - Research Flow, Data Logic, and Algorithm]], then sync the vault after substantive pipeline, recommendation, modeling, or manuscript changes.
+
 ## Main Notes
 
 - [[Import Workflow]]
@@ -28,6 +32,7 @@ This vault separates raw imports, reviewed source notes, and stable topic knowle
 - [[CMS MPD Recommendation - Research Manuscript Draft]]
 - [[CMS MPD Recommendation - Journal Manuscript Draft]]
 - [[CMS MPD Recommendation - Research Flow, Data Logic, and Algorithm]]
+- [[CMS MPD Recommendation - Data Lineage Table]]
 - [[CMS MPD Source Processing Summary - 2026-04-07]]
 - [[CMS MPD CY2025 Enrollment Workflow and Case Comparison]]
 

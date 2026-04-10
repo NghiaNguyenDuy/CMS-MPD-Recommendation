@@ -31,11 +31,19 @@ NETWORK_PRIORITY = {
     "adequate": 0,
     "limited_preferred_retail": 1,
     "no_preferred_retail": 2,
+    "unknown": 3,
 }
 FEATURE_VERSION = "research_v4"
 SIMULATION_POLICY = "cost_realism_v1"
 CHANNEL_NEAR_TIE_TOLERANCE = 1.0
 CHANNEL_ORDER = ("pref_retail", "nonpref_retail", "pref_mail", "nonpref_mail")
+AUTO_SELECT_SCORE_MARGIN = 20.0
+SCENARIO_LOW_UTILIZER = "low_utilizer"
+SCENARIO_MAINTENANCE_GENERIC = "maintenance_generic"
+SCENARIO_INSULIN_CHRONIC = "insulin_chronic"
+SCENARIO_SPECIALTY_HIGH_COST = "specialty_high_cost"
+SCENARIO_MIXED_RESTRICTION = "mixed_restriction"
+SCENARIO_ACCESS_SENSITIVE = "access_sensitive"
 FOCUS_WEIGHTS = {
     "balanced": {
         "cost": 0.28,
@@ -107,6 +115,7 @@ NETWORK_ACCESS_BASE = {
     "adequate": 100.0,
     "limited_preferred_retail": 76.0,
     "no_preferred_retail": 52.0,
+    "unknown": 40.0,
 }
 CHANNEL_LABELS = {
     "pref_retail": "preferred retail",
@@ -160,6 +169,20 @@ class MedicationMatch:
     match_confidence: str
     normalized_day_supply: int
     tier_family: str
+
+
+@dataclass(slots=True)
+class DrugResolutionCandidate:
+    drug_name: str
+    rxcui: str
+    ndc: str
+    match_source: str
+    match_confidence: str
+    score: float
+    local_plan_coverage: int
+    available_day_supply_options: list[int]
+    available_tier_family_options: list[str]
+    is_insulin: bool
 
 
 @dataclass(slots=True)
@@ -333,6 +356,9 @@ class PlanRecommendation:
     nearest_preferred_distance_miles: float | None
     service_area_eligible: bool
     comparison_only: bool
+    scenario_profile: str
+    match_review_required: bool
+    unsafe_reasons: list[str]
     feature_version: str
     drug_breakdowns: list[PlanDrugBreakdown]
     contract_year: int | None = None
@@ -349,6 +375,10 @@ class RecommendationBundleSummary:
     local_full_coverage_count: int
     local_partial_count: int
     fallback_reason: str
+    scenario_profile: str = SCENARIO_LOW_UTILIZER
+    candidate_plan_count_service_area: int = 0
+    candidate_plan_count_ranked: int = 0
+    plans_with_unknown_network_count: int = 0
 
 
 @dataclass(slots=True)
@@ -472,10 +502,10 @@ def _candidate_plan_query(conn: duckdb.DuckDBPyConnection) -> str:
             {contract_year_select},
             ps.annual_premium,
             ps.deductible,
-            pns.network_flag
+            coalesce(pns.network_flag, 'unknown') AS network_flag
         FROM gold.plan_service_area psa
         JOIN gold.plan_summary ps ON psa.plan_key = ps.plan_key
-        JOIN gold.plan_network_summary pns ON psa.plan_key = pns.plan_key
+        LEFT JOIN gold.plan_network_summary pns ON psa.plan_key = pns.plan_key
         WHERE psa.zip_code = ?
         ORDER BY ps.plan_name
         """
@@ -585,6 +615,8 @@ def _fit_label(score: float) -> str:
 
 
 def _network_access_summary(network_flag: str, distance_miles: float | None) -> str:
+    if network_flag == "unknown":
+        return "Preferred retail pharmacy data is incomplete for this plan."
     if network_flag == "no_preferred_retail":
         return "No preferred retail pharmacy access was identified."
     if network_flag == "limited_preferred_retail":
@@ -688,6 +720,11 @@ def _build_watchouts(
             watchouts,
             f"Utilization management remains present: {recommendation.restriction_summary}.",
         )
+    if recommendation.network_flag == "unknown":
+        _append_unique(
+            watchouts,
+            "Pharmacy network data is incomplete for this plan and should be verified before enrollment.",
+        )
     if recommendation.nearest_preferred_distance_miles is not None and recommendation.nearest_preferred_distance_miles > 15:
         _append_unique(
             watchouts,
@@ -698,7 +735,7 @@ def _build_watchouts(
             watchouts,
             f"The projected yearly fill path switches pharmacy channels {recommendation.channel_switch_count} time(s).",
         )
-    if approximate_match_count > 0:
+    if recommendation.match_review_required or approximate_match_count > 0:
         _append_unique(watchouts, "At least one medication match is approximate and should be reviewed.")
     return watchouts[:3]
 
@@ -729,123 +766,287 @@ def _build_fit_summary(
     )
 
 
-def _resolve_drug_match(
-    conn: duckdb.DuckDBPyConnection, medication: MedicationInput
-) -> tuple[dict[str, Any], MedicationMatch]:
-    requested_value = medication.ndc or medication.rxcui or medication.drug_name or ""
-    if medication.ndc:
-        df = _fetch_dataframe(
-            conn,
-            """
-            SELECT *
+def _normalize_drug_search_text(value: str | None) -> str:
+    cleaned = re.sub(r"\[[^\]]*\]", " ", str(value or "").lower())
+    cleaned = re.sub(r"[^a-z0-9\s/-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    tokens: list[str] = []
+    for token in cleaned.split():
+        if any(char.isdigit() for char in token):
+            break
+        tokens.append(token)
+    return " ".join(tokens).strip() or cleaned
+
+
+def _canonical_drug_reference_frame(conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    return _fetch_dataframe(
+        conn,
+        """
+        WITH reference_rows AS (
+            SELECT
+                ndc,
+                rxcui,
+                preferred_name,
+                coalesce(synonym, '') AS synonym,
+                is_insulin,
+                0 AS source_rank
             FROM silver.dim_drug_reference
-            WHERE ndc = ?
-            ORDER BY is_insulin DESC
-            LIMIT 1
-            """,
-            [medication.ndc.strip().zfill(11)],
+            WHERE ndc IS NOT NULL
+              AND trim(coalesce(preferred_name, synonym, '')) <> ''
+
+            UNION ALL
+
+            SELECT DISTINCT
+                ndc,
+                rxcui,
+                drug_name AS preferred_name,
+                coalesce(drug_name, '') AS synonym,
+                is_insulin,
+                1 AS source_rank
+            FROM gold.plan_drug_cost_basis
+            WHERE ndc IS NOT NULL
+              AND trim(coalesce(drug_name, '')) <> ''
+        ),
+        ranked AS (
+            SELECT
+                ndc,
+                rxcui,
+                preferred_name,
+                synonym,
+                is_insulin,
+                row_number() OVER (
+                    PARTITION BY ndc
+                    ORDER BY source_rank, length(coalesce(preferred_name, synonym, ndc)), coalesce(preferred_name, synonym, ndc)
+                ) AS rn
+            FROM reference_rows
         )
+        SELECT ndc, rxcui, preferred_name, synonym, is_insulin
+        FROM ranked
+        WHERE rn = 1
+        """
+    )
+
+
+def _candidate_local_metadata(
+    conn: duckdb.DuckDBPyConnection,
+    ndcs: list[str],
+    plan_keys: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not ndcs or not plan_keys:
+        return {}
+    ndc_placeholders = ", ".join("?" for _ in ndcs)
+    plan_placeholders = ", ".join("?" for _ in plan_keys)
+    df = _fetch_dataframe(
+        conn,
+        f"""
+        SELECT
+            ndc,
+            count(DISTINCT plan_key) AS local_plan_coverage,
+            list(DISTINCT days_supply) FILTER (WHERE days_supply IS NOT NULL) AS available_day_supply_options,
+            list(DISTINCT tier_family) FILTER (WHERE tier_family IS NOT NULL) AS available_tier_family_options,
+            max(CASE WHEN is_insulin THEN 1 ELSE 0 END) AS is_insulin
+        FROM gold.plan_drug_cost_basis
+        WHERE ndc IN ({ndc_placeholders})
+          AND plan_key IN ({plan_placeholders})
+        GROUP BY 1
+        """,
+        ndcs + plan_keys,
+    )
+    lookup: dict[str, dict[str, Any]] = {}
+    def _as_list(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, str):
+            return [value]
+        if hasattr(value, "tolist"):
+            converted = value.tolist()
+            return converted if isinstance(converted, list) else [converted]
+        try:
+            return list(value)
+        except TypeError:
+            return [value]
+
+    for row in df.to_dict("records"):
+        raw_day_supply_options = _as_list(row.get("available_day_supply_options"))
+        day_supply_options = sorted(
+            {
+                int(float(value))
+                for value in raw_day_supply_options
+                if value is not None and not pd.isna(value)
+            }
+        )
+        raw_tier_family_options = _as_list(row.get("available_tier_family_options"))
+        tier_family_options = sorted(
+            {
+                str(value)
+                for value in raw_tier_family_options
+                if value not in {None, ""}
+            }
+        )
+        lookup[str(row["ndc"])] = {
+            "local_plan_coverage": int(row.get("local_plan_coverage") or 0),
+            "available_day_supply_options": day_supply_options,
+            "available_tier_family_options": tier_family_options,
+            "is_insulin": bool(row.get("is_insulin")),
+        }
+    return lookup
+
+
+def _score_drug_candidate(
+    medication: MedicationInput,
+    candidate_row: dict[str, Any],
+    requested_day_supply: int,
+) -> tuple[float, str, str] | None:
+    requested_ndc = str(medication.ndc).strip().zfill(11) if medication.ndc else ""
+    requested_rxcui = str(medication.rxcui or "").strip()
+    requested_name = str(medication.drug_name or "").strip().lower()
+    requested_normalized = _normalize_drug_search_text(medication.drug_name)
+    requested_tokens = [token for token in requested_normalized.split() if token]
+    drug_name = str(candidate_row["preferred_name"])
+    synonym = str(candidate_row.get("synonym") or "")
+    normalized_name = _normalize_drug_search_text(drug_name)
+    normalized_synonym = _normalize_drug_search_text(synonym)
+
+    if requested_ndc:
+        if str(candidate_row["ndc"]) != requested_ndc:
+            return None
+        base_score = 100.0
         match_source = "ndc"
         match_confidence = "exact"
-    elif medication.rxcui:
-        df = _fetch_dataframe(
-            conn,
-            """
-            SELECT *
-            FROM silver.dim_drug_reference
-            WHERE rxcui = ?
-            ORDER BY is_insulin DESC
-            LIMIT 1
-            """,
-            [medication.rxcui.strip()],
-        )
+    elif requested_rxcui:
+        if str(candidate_row["rxcui"]) != requested_rxcui:
+            return None
+        base_score = 95.0
         match_source = "rxcui"
         match_confidence = "exact"
+    elif requested_name:
+        if drug_name.lower() == requested_name:
+            base_score = 85.0
+            match_source = "exact_name"
+            match_confidence = "exact"
+        elif synonym.lower() == requested_name:
+            base_score = 80.0
+            match_source = "synonym"
+            match_confidence = "exact"
+        elif requested_normalized and (
+            normalized_name == requested_normalized
+            or normalized_synonym == requested_normalized
+            or normalized_name.startswith(requested_normalized)
+            or normalized_synonym.startswith(requested_normalized)
+        ):
+            base_score = 65.0
+            match_source = "normalized_name"
+            match_confidence = "approximate"
+        elif requested_tokens and all(
+            token in f"{normalized_name} {normalized_synonym}" for token in requested_tokens
+        ):
+            base_score = 50.0
+            match_source = "prefix_match"
+            match_confidence = "approximate"
+        elif requested_tokens and any(
+            text.startswith(requested_tokens[0]) for text in (normalized_name, normalized_synonym) if text
+        ):
+            base_score = 50.0
+            match_source = "prefix_match"
+            match_confidence = "approximate"
+        else:
+            return None
     else:
-        exact_name = _fetch_dataframe(
-            conn,
-            """
-            SELECT *
-            FROM silver.dim_drug_reference
-            WHERE lower(preferred_name) = lower(?)
-            ORDER BY is_insulin DESC
-            LIMIT 1
-            """,
-            [medication.drug_name or ""],
-        )
-        if not exact_name.empty:
-            row = exact_name.iloc[0].to_dict()
-            return row, MedicationMatch(
-                medication_id="",
-                requested_value=requested_value,
-                requested_drug_name=medication.drug_name,
-                resolved_drug_name=str(row["preferred_name"]),
-                rxcui=str(row["rxcui"]),
-                ndc=str(row["ndc"]),
-                match_source="exact_name",
-                match_confidence="exact",
-                normalized_day_supply=30,
-                tier_family="brand",
-            )
+        return None
 
-        exact_synonym = _fetch_dataframe(
-            conn,
-            """
-            SELECT *
-            FROM silver.dim_drug_reference
-            WHERE lower(coalesce(synonym, '')) = lower(?)
-            ORDER BY is_insulin DESC
-            LIMIT 1
-            """,
-            [medication.drug_name or ""],
-        )
-        if not exact_synonym.empty:
-            row = exact_synonym.iloc[0].to_dict()
-            return row, MedicationMatch(
-                medication_id="",
-                requested_value=requested_value,
-                requested_drug_name=medication.drug_name,
-                resolved_drug_name=str(row["preferred_name"]),
-                rxcui=str(row["rxcui"]),
-                ndc=str(row["ndc"]),
-                match_source="synonym",
-                match_confidence="exact",
-                normalized_day_supply=30,
-                tier_family="brand",
-            )
+    local_plan_coverage = int(candidate_row.get("local_plan_coverage") or 0)
+    available_day_supply_options = [
+        int(value) for value in (candidate_row.get("available_day_supply_options") or []) if value is not None
+    ]
+    score = base_score + 0.01 * local_plan_coverage
+    if requested_day_supply in available_day_supply_options:
+        score += 5.0
+    return score, match_source, match_confidence
 
-        pattern = (medication.drug_name or "").strip().lower() + "%"
-        df = _fetch_dataframe(
-            conn,
-            """
-            SELECT *
-            FROM silver.dim_drug_reference
-            WHERE lower(preferred_name) LIKE ?
-               OR lower(coalesce(synonym, '')) LIKE ?
-            ORDER BY is_insulin DESC, preferred_name
-            LIMIT 1
-            """,
-            [pattern, pattern],
-        )
-        match_source = "prefix_match"
-        match_confidence = "approximate"
 
-    if df.empty:
-        raise ValueError(f"Could not resolve medication input: {requested_value}")
-
-    row = df.iloc[0].to_dict()
-    return row, MedicationMatch(
-        medication_id="",
-        requested_value=requested_value,
-        requested_drug_name=medication.drug_name,
-        resolved_drug_name=str(row["preferred_name"]),
-        rxcui=str(row["rxcui"]),
-        ndc=str(row["ndc"]),
-        match_source=match_source,
-        match_confidence=match_confidence,
-        normalized_day_supply=30,
-        tier_family="brand",
+def resolve_drug_candidates(
+    conn: duckdb.DuckDBPyConnection,
+    medication: MedicationInput,
+    plan_keys: list[str],
+    *,
+    day_supply: int,
+    limit: int = 10,
+) -> list[DrugResolutionCandidate]:
+    reference_df = _canonical_drug_reference_frame(conn)
+    if reference_df.empty:
+        return []
+    matched_rows: list[dict[str, Any]] = []
+    for row in reference_df.to_dict("records"):
+        if _score_drug_candidate(medication, row, day_supply) is not None:
+            matched_rows.append(row)
+    if not matched_rows:
+        return []
+    metadata_lookup = _candidate_local_metadata(
+        conn,
+        [str(row["ndc"]) for row in matched_rows],
+        plan_keys,
     )
+    candidates: list[DrugResolutionCandidate] = []
+    for row in matched_rows:
+        row["local_plan_coverage"] = metadata_lookup.get(str(row["ndc"]), {}).get("local_plan_coverage", 0)
+        row["available_day_supply_options"] = metadata_lookup.get(str(row["ndc"]), {}).get(
+            "available_day_supply_options",
+            [],
+        )
+        row["available_tier_family_options"] = metadata_lookup.get(str(row["ndc"]), {}).get(
+            "available_tier_family_options",
+            [],
+        )
+        row["is_insulin"] = metadata_lookup.get(str(row["ndc"]), {}).get("is_insulin", bool(row.get("is_insulin")))
+        scored = _score_drug_candidate(medication, row, day_supply)
+        if scored is None:
+            continue
+        score, match_source, match_confidence = scored
+        candidates.append(
+            DrugResolutionCandidate(
+                drug_name=str(row["preferred_name"]),
+                rxcui=str(row["rxcui"]),
+                ndc=str(row["ndc"]),
+                match_source=match_source,
+                match_confidence=match_confidence,
+                score=round(score, 2),
+                local_plan_coverage=int(row.get("local_plan_coverage") or 0),
+                available_day_supply_options=list(row.get("available_day_supply_options") or []),
+                available_tier_family_options=list(row.get("available_tier_family_options") or []),
+                is_insulin=bool(row.get("is_insulin")),
+            )
+        )
+    deduped: dict[str, DrugResolutionCandidate] = {}
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (
+            -float(item.score),
+            -int(item.local_plan_coverage),
+            item.drug_name,
+            item.ndc,
+        ),
+    ):
+        deduped.setdefault(candidate.ndc, candidate)
+    return list(deduped.values())[: max(1, limit)]
+
+
+def select_drug_candidate(
+    medication: MedicationInput,
+    candidates: list[DrugResolutionCandidate],
+) -> tuple[DrugResolutionCandidate | None, bool]:
+    if not candidates:
+        return None, False
+    if medication.ndc or medication.rxcui:
+        return candidates[0], False
+    if len(candidates) == 1:
+        return candidates[0], False
+    if float(candidates[0].score) - float(candidates[1].score) >= AUTO_SELECT_SCORE_MARGIN:
+        return candidates[0], False
+    return None, True
 
 
 def _resolve_defaults(
@@ -1537,12 +1738,8 @@ def _rules_ranking_sort_key(recommendation: PlanRecommendation) -> tuple[Any, ..
     return (
         _recommendation_bucket_index(recommendation),
         -int(recommendation.priced_drug_count),
-        -float(recommendation.fit_score),
-        float(recommendation.annual_total_cost),
+        *_scenario_sort_values(recommendation, recommendation.scenario_profile),
         int(recommendation.uncovered_drug_count),
-        int(recommendation.restriction_count),
-        NETWORK_PRIORITY.get(recommendation.network_flag, 99),
-        recommendation.plan_name,
     )
 
 
@@ -1572,7 +1769,70 @@ def _distance_sort_value(value: float | None) -> float:
     return float(value)
 
 
-def _full_coverage_compare_sort_key(recommendation: PlanRecommendation) -> tuple[Any, ...]:
+def _insulin_nonpreferred_dependency_count(recommendation: PlanRecommendation) -> int:
+    return sum(
+        1
+        for item in recommendation.drug_breakdowns
+        if item.insulin_flag and item.selected_channel in {"nonpref_retail", "nonpref_mail"}
+    )
+
+
+def _scenario_sort_values(recommendation: PlanRecommendation, scenario_profile: str) -> tuple[Any, ...]:
+    if scenario_profile == SCENARIO_SPECIALTY_HIGH_COST:
+        return (
+            int(recommendation.restriction_count),
+            int(recommendation.channel_switch_count),
+            NETWORK_PRIORITY.get(recommendation.network_flag, 99),
+            _distance_sort_value(recommendation.nearest_preferred_distance_miles),
+            float(recommendation.annual_total_cost),
+            -float(recommendation.fit_score),
+            recommendation.plan_name,
+        )
+    if scenario_profile == SCENARIO_INSULIN_CHRONIC:
+        return (
+            float(recommendation.annual_drug_oop),
+            int(_insulin_nonpreferred_dependency_count(recommendation)),
+            int(recommendation.channel_switch_count),
+            NETWORK_PRIORITY.get(recommendation.network_flag, 99),
+            _distance_sort_value(recommendation.nearest_preferred_distance_miles),
+            float(recommendation.annual_total_cost),
+            -float(recommendation.fit_score),
+            recommendation.plan_name,
+        )
+    if scenario_profile == SCENARIO_ACCESS_SENSITIVE:
+        return (
+            NETWORK_PRIORITY.get(recommendation.network_flag, 99),
+            _distance_sort_value(recommendation.nearest_preferred_distance_miles),
+            float(recommendation.annual_total_cost),
+            float(recommendation.annual_drug_oop),
+            int(recommendation.restriction_count),
+            int(recommendation.channel_switch_count),
+            -float(recommendation.fit_score),
+            recommendation.plan_name,
+        )
+    if scenario_profile == SCENARIO_MIXED_RESTRICTION:
+        return (
+            int(recommendation.restriction_count),
+            float(recommendation.annual_total_cost),
+            float(recommendation.annual_drug_oop),
+            NETWORK_PRIORITY.get(recommendation.network_flag, 99),
+            _distance_sort_value(recommendation.nearest_preferred_distance_miles),
+            int(recommendation.channel_switch_count),
+            -float(recommendation.fit_score),
+            recommendation.plan_name,
+        )
+    if scenario_profile == SCENARIO_MAINTENANCE_GENERIC:
+        return (
+            float(recommendation.annual_total_cost),
+            float(recommendation.annual_premium),
+            float(recommendation.annual_drug_oop),
+            int(recommendation.restriction_count),
+            NETWORK_PRIORITY.get(recommendation.network_flag, 99),
+            _distance_sort_value(recommendation.nearest_preferred_distance_miles),
+            int(recommendation.channel_switch_count),
+            -float(recommendation.fit_score),
+            recommendation.plan_name,
+        )
     return (
         float(recommendation.annual_total_cost),
         float(recommendation.annual_drug_oop),
@@ -1585,17 +1845,143 @@ def _full_coverage_compare_sort_key(recommendation: PlanRecommendation) -> tuple
     )
 
 
-def _partial_fallback_sort_key(recommendation: PlanRecommendation) -> tuple[Any, ...]:
+def _full_coverage_compare_sort_key(recommendation: PlanRecommendation) -> tuple[Any, ...]:
+    return _scenario_sort_values(recommendation, recommendation.scenario_profile)
+
+
+def _local_coverable_counts(recommendations: list[PlanRecommendation]) -> dict[str, int]:
+    if not recommendations:
+        return {}
+    requested_medications = recommendations[0].resolved_medications
+    local_coverable_counts = {item.medication_id: 0 for item in requested_medications}
+    for recommendation in recommendations:
+        coverable_ids = {
+            item.medication_id
+            for item in recommendation.drug_breakdowns
+            if item.coverage_status == "covered" and item.pricing_status == "priced"
+        }
+        for medication_id in coverable_ids:
+            if medication_id in local_coverable_counts:
+                local_coverable_counts[medication_id] += 1
+    return local_coverable_counts
+
+
+def _fallback_group(recommendation: PlanRecommendation, local_coverable_counts: dict[str, int]) -> str:
+    if recommendation.network_flag == "unknown":
+        return "network_unknown"
+    if any(item.pricing_status == "channel_unavailable" for item in recommendation.drug_breakdowns):
+        return "access_blocked"
+    if any(
+        local_coverable_counts.get(item.medication_id, 0) == 0
+        and item.coverage_status != "covered"
+        for item in recommendation.drug_breakdowns
+    ):
+        return "never_local_coverable"
+    return "not_jointly_coverable"
+
+
+def _fallback_group_index(group_name: str) -> int:
+    ordering = {
+        "never_local_coverable": 0,
+        "not_jointly_coverable": 1,
+        "access_blocked": 2,
+        "network_unknown": 3,
+    }
+    return ordering.get(group_name, 99)
+
+
+def _partial_fallback_sort_key(
+    recommendation: PlanRecommendation,
+    local_coverable_counts: dict[str, int] | None = None,
+) -> tuple[Any, ...]:
+    blocker_group = _fallback_group(recommendation, local_coverable_counts or {})
     return (
+        _fallback_group_index(blocker_group),
         -float(_coverage_pct_requested(recommendation)),
         -int(recommendation.priced_drug_count),
-        float(recommendation.annual_total_cost),
-        int(recommendation.restriction_count),
-        NETWORK_PRIORITY.get(recommendation.network_flag, 99),
-        _distance_sort_value(recommendation.nearest_preferred_distance_miles),
-        -float(recommendation.fit_score),
-        recommendation.plan_name,
+        *_scenario_sort_values(recommendation, recommendation.scenario_profile),
     )
+
+
+def _unsafe_reasons(recommendation: PlanRecommendation) -> list[str]:
+    reasons: list[str] = []
+    if recommendation.uncovered_drug_count > 0:
+        reasons.append("uncovered_exact_drug")
+    if any(item.pricing_status == "missing_price" for item in recommendation.drug_breakdowns):
+        reasons.append("exact_drug_missing_price")
+    if any(item.pricing_status == "channel_unavailable" for item in recommendation.drug_breakdowns):
+        reasons.append("no_usable_channel")
+    if recommendation.network_flag == "unknown":
+        reasons.append("unknown_network_data")
+    if recommendation.nearest_preferred_distance_miles is not None and recommendation.nearest_preferred_distance_miles > 15:
+        reasons.append("long_preferred_distance")
+    if recommendation.restriction_count >= 2:
+        reasons.append("high_um_friction")
+    if recommendation.match_review_required:
+        reasons.append("approximate_match_unreviewed")
+    return reasons
+
+
+def _determine_scenario_profile(
+    recommendations: list[PlanRecommendation],
+    beneficiary: BeneficiaryInput,
+) -> str:
+    if not recommendations:
+        return SCENARIO_LOW_UTILIZER
+    requested_drug_count = max(1, len(recommendations[0].resolved_medications))
+    resolved = recommendations[0].resolved_medications
+    if any(str(item.tier_family).lower() == "specialty" for item in resolved):
+        return SCENARIO_SPECIALTY_HIGH_COST
+
+    annual_spend_by_medication: dict[str, float] = {}
+    restricted_medications: set[str] = set()
+    insulin_present = False
+    known_distances = [
+        float(item.nearest_preferred_distance_miles)
+        for item in recommendations
+        if item.nearest_preferred_distance_miles is not None and not pd.isna(item.nearest_preferred_distance_miles)
+    ]
+    for recommendation in recommendations:
+        for item in recommendation.drug_breakdowns:
+            annual_spend_by_medication[item.medication_id] = max(
+                annual_spend_by_medication.get(item.medication_id, 0.0),
+                float(item.negotiated_price_total or 0.0),
+            )
+            if item.pa_flag or item.st_flag or item.ql_flag:
+                restricted_medications.add(item.medication_id)
+            if item.insulin_flag:
+                insulin_present = True
+    if sum(annual_spend_by_medication.values()) >= 6000.0:
+        return SCENARIO_SPECIALTY_HIGH_COST
+    if any(
+        annual_spend_by_medication.get(medication_id, 0.0) >= 2000.0
+        for medication_id in restricted_medications
+    ):
+        return SCENARIO_SPECIALTY_HIGH_COST
+    if insulin_present:
+        return SCENARIO_INSULIN_CHRONIC
+    if len(restricted_medications) >= 2:
+        return SCENARIO_MIXED_RESTRICTION
+    if (
+        beneficiary.pharmacy_preference != "auto"
+        or (known_distances and min(known_distances) > 15.0)
+        or not any(item.network_flag == "adequate" for item in recommendations)
+    ):
+        return SCENARIO_ACCESS_SENSITIVE
+    if requested_drug_count <= 3 and all(str(item.tier_family).lower() == "generic" for item in resolved):
+        return SCENARIO_MAINTENANCE_GENERIC
+    return SCENARIO_LOW_UTILIZER
+
+
+def _apply_run_profile(
+    recommendations: list[PlanRecommendation],
+    beneficiary: BeneficiaryInput,
+) -> str:
+    scenario_profile = _determine_scenario_profile(recommendations, beneficiary)
+    for recommendation in recommendations:
+        recommendation.scenario_profile = scenario_profile
+        recommendation.unsafe_reasons = _unsafe_reasons(recommendation)
+    return scenario_profile
 
 
 def _assign_plan_ranks(recommendations: list[PlanRecommendation]) -> list[PlanRecommendation]:
@@ -1605,7 +1991,15 @@ def _assign_plan_ranks(recommendations: list[PlanRecommendation]) -> list[PlanRe
 
 
 def _derive_alternative_search_seed(drug_name: str | None) -> str:
-    cleaned = re.sub(r"\[[^\]]*\]", "", str(drug_name or "")).strip()
+    cleaned = re.sub(r"\[[^\]]*\]", " ", str(drug_name or "")).strip()
+    cleaned = re.sub(
+        r"\b(tablet|capsule|solution|suspension|inhalation|inhaler|injectable|injection|oral|extended|release|hr|actuat|powder|cream|ointment|patch|kit|pack)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[^A-Za-z0-9\s/-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         return ""
     tokens: list[str] = []
@@ -1622,16 +2016,7 @@ def _build_blocked_medications(recommendations: list[PlanRecommendation]) -> lis
         return []
 
     requested_medications = recommendations[0].resolved_medications
-    local_coverable_counts = {item.medication_id: 0 for item in requested_medications}
-    for recommendation in recommendations:
-        coverable_ids = {
-            item.medication_id
-            for item in recommendation.drug_breakdowns
-            if item.coverage_status == "covered" and item.pricing_status == "priced"
-        }
-        for medication_id in coverable_ids:
-            if medication_id in local_coverable_counts:
-                local_coverable_counts[medication_id] += 1
+    local_coverable_counts = _local_coverable_counts(recommendations)
 
     blocked: list[BlockedMedication] = []
     for match in requested_medications:
@@ -1798,25 +2183,52 @@ def _generate_recommendations(
         logger.warning("no candidate plans found for zipcode=%s", zipcode)
         return []
 
+    plan_keys = candidate_plans["plan_key"].tolist()
     resolved_medications: list[dict[str, Any]] = []
     matches: list[MedicationMatch] = []
     for medication_index, medication in enumerate(medications, start=1):
         medication_id = f"med_{medication_index}"
-        drug_row, match = _resolve_drug_match(conn, medication)
         day_supply = _normalize_days_supply(medication.day_supply)
-        tier_family = _infer_tier_family(
-            conn, str(drug_row["ndc"]), day_supply, medication.tier_family
+        candidates = resolve_drug_candidates(
+            conn,
+            medication,
+            plan_keys,
+            day_supply=day_supply,
         )
-        defaults = _resolve_defaults(conn, str(drug_row["ndc"]), day_supply, tier_family)
+        selected_candidate, match_review_required = select_drug_candidate(medication, candidates)
+        if not candidates:
+            conn.close()
+            requested_value = medication.ndc or medication.rxcui or medication.drug_name or medication_id
+            raise ValueError(f"Could not resolve medication input: {requested_value}")
+        if selected_candidate is None:
+            conn.close()
+            preview = "; ".join(
+                f"{item.drug_name} (NDC {item.ndc}, {item.local_plan_coverage} local plans)"
+                for item in candidates[:3]
+            )
+            requested_value = medication.drug_name or medication.ndc or medication.rxcui or medication_id
+            raise ValueError(
+                f"Medication '{requested_value}' needs manual review before ranking. "
+                f"Top candidates: {preview}. Provide an exact NDC/RXCUI or choose from the drug catalog."
+            )
+
+        tier_family = _infer_tier_family(
+            conn,
+            str(selected_candidate.ndc),
+            day_supply,
+            medication.tier_family,
+        )
+        defaults = _resolve_defaults(conn, str(selected_candidate.ndc), day_supply, tier_family)
+        requested_value = medication.ndc or medication.rxcui or medication.drug_name or ""
         resolved_match = MedicationMatch(
             medication_id=medication_id,
-            requested_value=match.requested_value,
+            requested_value=str(requested_value),
             requested_drug_name=medication.drug_name,
-            resolved_drug_name=match.resolved_drug_name,
-            rxcui=match.rxcui,
-            ndc=match.ndc,
-            match_source=match.match_source,
-            match_confidence=match.match_confidence,
+            resolved_drug_name=str(selected_candidate.drug_name),
+            rxcui=str(selected_candidate.rxcui),
+            ndc=str(selected_candidate.ndc),
+            match_source=selected_candidate.match_source,
+            match_confidence=selected_candidate.match_confidence,
             normalized_day_supply=day_supply,
             tier_family=tier_family,
         )
@@ -1826,10 +2238,10 @@ def _generate_recommendations(
                 "medication_id": medication_id,
                 "input": medication,
                 "requested_drug_name": medication.drug_name,
-                "drug_name": str(drug_row["preferred_name"]),
-                "rxcui": str(drug_row["rxcui"]),
-                "ndc": str(drug_row["ndc"]),
-                "is_insulin": bool(drug_row["is_insulin"]),
+                "drug_name": str(selected_candidate.drug_name),
+                "rxcui": str(selected_candidate.rxcui),
+                "ndc": str(selected_candidate.ndc),
+                "is_insulin": bool(selected_candidate.is_insulin),
                 "day_supply": day_supply,
                 "tier_family": tier_family,
                 "quantity": float(medication.quantity_override or defaults["default_quantity"] or day_supply),
@@ -1839,10 +2251,11 @@ def _generate_recommendations(
                     or max(1, math.ceil(365 / day_supply))
                 ),
                 "match": resolved_match,
+                "resolution_candidates": candidates,
+                "match_review_required": bool(match_review_required),
             }
         )
 
-    plan_keys = candidate_plans["plan_key"].tolist()
     placeholders = ", ".join("?" for _ in plan_keys)
     basis_df = _fetch_dataframe(
         conn,
@@ -2240,6 +2653,14 @@ def _generate_recommendations(
                 "Preferred retail pharmacy access is limited for this ZIP.",
                 severity="warning",
             )
+        elif plan["network_flag"] == "unknown":
+            _append_explanation(
+                groups.pharmacy_access_issues,
+                detail_groups.pharmacy_access_issues,
+                "unknown_network_data",
+                "Pharmacy network data is incomplete for this plan and should be verified.",
+                severity="warning",
+            )
         if nearest_distance is not None and nearest_distance > 15:
             _append_explanation(
                 groups.pharmacy_access_issues,
@@ -2338,6 +2759,11 @@ def _generate_recommendations(
                 else None,
                 service_area_eligible=True,
                 comparison_only=False,
+                scenario_profile=SCENARIO_LOW_UTILIZER,
+                match_review_required=any(
+                    bool(item.get("match_review_required")) for item in resolved_medications
+                ),
+                unsafe_reasons=[],
                 feature_version=FEATURE_VERSION,
                 drug_breakdowns=breakdowns,
                 contract_year=contract_year,
@@ -2349,6 +2775,7 @@ def _generate_recommendations(
         )
 
     _apply_fit_scoring(recommendations, beneficiary)
+    _apply_run_profile(recommendations, beneficiary)
     recommendations.sort(key=_rules_ranking_sort_key)
     for rank, recommendation in enumerate(recommendations, start=1):
         recommendation.plan_rank = rank
@@ -2390,6 +2817,8 @@ def recommend_plan_bundle(
         config=config,
         ranking_mode=ranking_mode,
     )
+    scenario_profile = recommendations[0].scenario_profile if recommendations else SCENARIO_LOW_UTILIZER
+    local_coverable_counts = _local_coverable_counts(recommendations)
     shortlist_limit = max(1, beneficiary.top_n)
     full_coverage = sorted(
         [item for item in recommendations if _is_full_coverage_plan(item)],
@@ -2397,7 +2826,7 @@ def recommend_plan_bundle(
     )
     partial_fallback = sorted(
         [item for item in recommendations if not _is_full_coverage_plan(item)],
-        key=_partial_fallback_sort_key,
+        key=lambda item: _partial_fallback_sort_key(item, local_coverable_counts),
     )
     displayed_full_coverage = _assign_plan_ranks(full_coverage[:shortlist_limit])
     displayed_partial_fallback: list[PlanRecommendation] = []
@@ -2413,6 +2842,10 @@ def recommend_plan_bundle(
             local_full_coverage_count=len(full_coverage),
             local_partial_count=len(partial_fallback),
             fallback_reason="none" if full_coverage else "no_local_full_coverage",
+            scenario_profile=scenario_profile,
+            candidate_plan_count_service_area=len(recommendations),
+            candidate_plan_count_ranked=len(recommendations),
+            plans_with_unknown_network_count=sum(1 for item in recommendations if item.network_flag == "unknown"),
         ),
         full_coverage_plans=displayed_full_coverage,
         partial_fallback_plans=displayed_partial_fallback,

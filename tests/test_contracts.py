@@ -246,6 +246,9 @@ def _sample_recommendation(
         nearest_preferred_distance_miles=nearest_distance_miles,
         service_area_eligible=not comparison_only,
         comparison_only=comparison_only,
+        scenario_profile="insulin_chronic" if restriction_count else "low_utilizer",
+        match_review_required=False,
+        unsafe_reasons=["uncovered_exact_drug"] if uncovered_drug_count else [],
         feature_version="research_v4",
         drug_breakdowns=[drug_breakdown],
         contract_year=2025,
@@ -649,6 +652,9 @@ def test_decision_support_exports_and_counselor_note():
         "PLAN_KEY",
         "PLAN_NAME",
         "eligibility_status",
+        "scenario_profile",
+        "match_review_required",
+        "unsafe_reasons",
         "contract_year",
         "benefit_design",
         "priced_drug_count",
@@ -685,6 +691,10 @@ def test_recommendation_bundle_serializers_keep_grouped_sections():
             local_full_coverage_count=1,
             local_partial_count=6,
             fallback_reason="none",
+            scenario_profile="insulin_chronic",
+            candidate_plan_count_service_area=7,
+            candidate_plan_count_ranked=7,
+            plans_with_unknown_network_count=0,
         ),
         full_coverage_plans=[full_recommendation],
         partial_fallback_plans=[],
@@ -713,6 +723,7 @@ def test_recommendation_bundle_serializers_keep_grouped_sections():
     frames = recommendation_bundle_to_dataframes(bundle, run_id="bundle123", minimum_coverage_pct=100.0)
 
     assert frames["summary"].iloc[0]["local_full_coverage_count"] == 1
+    assert frames["summary"].iloc[0]["scenario_profile"] == "insulin_chronic"
     assert frames["full_coverage_plans"].iloc[0]["PLAN_KEY"] == "H1000001000"
     assert bool(frames["comparison_only_plans"].iloc[0]["comparison_only"]) is True
     assert frames["blocked_medications"].iloc[0]["blocker_type"] == "never_local_coverable"
@@ -721,6 +732,7 @@ def test_recommendation_bundle_serializers_keep_grouped_sections():
     payload = recommendation_bundle_to_public_payload(bundle, run_id="bundle123", minimum_coverage_pct=100.0)
 
     assert payload["summary"]["fallback_reason"] == "none"
+    assert payload["summary"]["scenario_profile"] == "insulin_chronic"
     assert payload["full_coverage_plans"][0]["PLAN_NAME"] == "Alpha Choice"
     assert payload["blocked_medications"][0]["medication_id"] == "med_1"
 

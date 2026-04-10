@@ -38,6 +38,7 @@ from cms_mpd.app_support import (
     format_drug_catalog_option,
     haversine_miles,
     parse_medication_frame,
+    rank_alternative_matches,
     search_drug_catalog,
     summarize_drug_channel_path,
     summarize_evidence_gaps,
@@ -65,6 +66,15 @@ from cms_mpd.research_eval import (
 
 
 st.set_page_config(page_title="CMS MPD Recommendation", layout="wide")
+
+SCENARIO_IMPACT_NOTES = {
+    "low_utilizer": "This scenario emphasizes full coverage first, then total annual cost and premium friction.",
+    "maintenance_generic": "This scenario emphasizes reliable full coverage for a simpler maintenance regimen and then keeps total cost low.",
+    "insulin_chronic": "This scenario emphasizes insulin channel stability, drug OOP, and access before secondary cost tradeoffs.",
+    "specialty_high_cost": "This scenario emphasizes utilization-management burden, continuity, and access before secondary cost tradeoffs.",
+    "mixed_restriction": "This scenario emphasizes blocker clarity and restriction burden before cost tradeoffs.",
+    "access_sensitive": "This scenario emphasizes pharmacy network confidence and distance before secondary cost tradeoffs.",
+}
 
 
 def _inject_styles() -> None:
@@ -1066,27 +1076,32 @@ def main() -> None:
                     st.error(error)
             else:
                 beneficiary = _beneficiary_from_contracts(profile_contract, preference_contract)
-                with st.spinner("Running recommendation engine and comparison workflow..."):
-                    bundle = recommend_plan_bundle(
-                        beneficiary,
-                        medications,
-                        config=config,
-                        ranking_mode=preference_contract.ranking_mode,
-                    )
-                    comparison_recs = []
-                    local_plan_keys = {
-                        row.plan_key
-                        for row in (bundle.full_coverage_plans + bundle.partial_fallback_plans)
-                    }
-                    if preference_contract.allow_comparison_plans and local_plan_keys:
-                        comparison_recs = _comparison_recommendations(
-                            config,
+                try:
+                    with st.spinner("Running recommendation engine and comparison workflow..."):
+                        bundle = recommend_plan_bundle(
                             beneficiary,
                             medications,
-                            max_distance_miles=preference_contract.max_comparison_distance_miles,
-                            local_plan_keys=local_plan_keys,
+                            config=config,
+                            ranking_mode=preference_contract.ranking_mode,
                         )
-                        bundle = replace(bundle, comparison_only_plans=comparison_recs[:5])
+                        comparison_recs = []
+                        local_plan_keys = {
+                            row.plan_key
+                            for row in (bundle.full_coverage_plans + bundle.partial_fallback_plans)
+                        }
+                        if preference_contract.allow_comparison_plans and local_plan_keys:
+                            comparison_recs = _comparison_recommendations(
+                                config,
+                                beneficiary,
+                                medications,
+                                max_distance_miles=preference_contract.max_comparison_distance_miles,
+                                local_plan_keys=local_plan_keys,
+                            )
+                            bundle = replace(bundle, comparison_only_plans=comparison_recs[:5])
+                except ValueError as exc:
+                    _clear_result_state()
+                    st.error(str(exc))
+                    return
 
                 run_id = uuid.uuid4().hex[:12]
                 bundle_frames = recommendation_bundle_to_dataframes(
@@ -1191,6 +1206,13 @@ def main() -> None:
             _render_metric_cards(result_df)
         if not result_summary_df.empty:
             summary_row = result_summary_df.iloc[0]
+            scenario_profile = str(summary_row.get("scenario_profile") or "").strip()
+            if scenario_profile:
+                scenario_label = scenario_profile.replace("_", " ")
+                st.caption(
+                    f"Scenario profile: `{scenario_profile}`. "
+                    f"{SCENARIO_IMPACT_NOTES.get(scenario_profile, scenario_label.capitalize())}"
+                )
             if (
                 str(summary_row.get("fallback_reason") or "") == "no_local_full_coverage"
                 and int(summary_row.get("local_candidate_plan_count") or 0) > 0
@@ -1232,8 +1254,18 @@ def main() -> None:
                 if "medication_id" in blocked_medications_df.columns
                 else {}
             )
+            blocked_rxcui_lookup = (
+                blocked_medications_df.set_index("medication_id")["rxcui"].astype(str).to_dict()
+                if "medication_id" in blocked_medications_df.columns
+                else {}
+            )
             drug_catalog = get_drug_catalog(str(config.db_path))
             current_rows = [dict(row) for row in st.session_state.get("medication_editor_rows", DEFAULT_MEDICATION_ROWS)]
+            scenario_profile = (
+                str(result_bundle.summary.scenario_profile or "")
+                if result_bundle is not None
+                else ""
+            )
             for alternative_row in alternative_search_terms_df.to_dict("records"):
                 medication_id = str(alternative_row.get("medication_id") or "")
                 search_term = str(alternative_row.get("search_term") or "").strip()
@@ -1246,6 +1278,18 @@ def main() -> None:
                     search_matches = search_matches[
                         search_matches["ndc"].fillna("").astype(str) != str(blocked_ndc)
                     ].reset_index(drop=True)
+                try:
+                    medication_index = int(medication_id.split("_")[-1]) - 1
+                except (TypeError, ValueError):
+                    medication_index = -1
+                existing_row = current_rows[medication_index] if 0 <= medication_index < len(current_rows) else {}
+                search_matches = rank_alternative_matches(
+                    search_matches,
+                    blocked_drug_name=resolved_drug_name,
+                    current_row=existing_row,
+                    blocked_rxcui=blocked_rxcui_lookup.get(medication_id),
+                    limit=10,
+                )
                 if search_matches.empty:
                     st.caption("No alternative products matched this search seed in the local drug catalog.")
                     continue
@@ -1256,11 +1300,26 @@ def main() -> None:
                     key=f"alternative_picker_{medication_id}",
                 )
                 selected_row = search_matches.iloc[option_labels.index(selected_label)]
-                try:
-                    medication_index = int(medication_id.split("_")[-1]) - 1
-                except (TypeError, ValueError):
-                    medication_index = -1
-                existing_row = current_rows[medication_index] if 0 <= medication_index < len(current_rows) else {}
+                selected_plan_coverage = int(selected_row.get("plan_coverage") or 0)
+                selected_is_insulin = bool(selected_row.get("is_insulin"))
+                prior_is_insulin = "insulin" in str(existing_row.get("drug_name") or resolved_drug_name).lower()
+                prior_tier_family = str(existing_row.get("tier_family") or "").strip().lower()
+                selected_tier_family_from_row = str(
+                    selected_row.get("tier_family") or existing_row.get("tier_family") or ""
+                ).strip().lower()
+                preserves_insulin = selected_is_insulin == prior_is_insulin
+                preserves_specialty = (
+                    (prior_tier_family == "specialty") == (selected_tier_family_from_row == "specialty")
+                )
+                st.caption(
+                    f"Local plan coverage: {selected_plan_coverage} plans. "
+                    f"Scenario impact: {SCENARIO_IMPACT_NOTES.get(scenario_profile, 'Review the new product before rerunning the shortlist.')}"
+                )
+                st.caption(
+                    "Preserves insulin status: "
+                    f"{'yes' if preserves_insulin else 'no'}; preserves specialty status: "
+                    f"{'yes' if preserves_specialty else 'no'}."
+                )
                 picker_cols = st.columns([1, 1, 1.2])
                 day_supply_options = catalog_available_day_supply_options(selected_row)
                 default_day_supply = int(existing_row.get("day_supply") or day_supply_options[0])

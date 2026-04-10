@@ -24,11 +24,13 @@ NETWORK_RISK_MAP = {
     "adequate": 0.0,
     "limited_preferred_retail": 1.0,
     "no_preferred_retail": 2.0,
+    "unknown": 1.5,
 }
 BASE_SCENARIO_COUNT = {
     "demo": 6,
-    "full": 12,
+    "full": 50,
 }
+SCENARIO_PRECISION_TARGET = 300
 EVALUATION_SPLIT_SEED = 42
 EVALUATION_TEST_FRACTION = 0.3
 
@@ -89,6 +91,13 @@ MODEL_NUMERIC_COLUMNS = [
     "zipcode_density_score",
     "nearest_preferred_distance_bucket",
     "network_risk_score",
+    "match_review_required_flag",
+    "unknown_network_data_flag",
+    "unsafe_reason_count",
+    "candidate_plan_count_service_area",
+    "candidate_plan_count_ranked",
+    "plans_with_unknown_network_count",
+    "plans_dropped_due_to_missing_data",
 ]
 
 MODEL_CATEGORICAL_COLUMNS = [
@@ -99,6 +108,8 @@ MODEL_CATEGORICAL_COLUMNS = [
     "pharmacy_preference",
     "zip_density_category",
     "scenario_bundle",
+    "scenario_profile",
+    "fallback_group",
 ]
 
 FEATURE_SUBSETS = {
@@ -361,16 +372,31 @@ def _scenario_relevance(group: pd.DataFrame) -> pd.DataFrame:
     return ordered[["scenario_id", "plan_key", "weak_label_rank", "weak_label_relevance"]]
 
 
-def _choose_drug(conn: duckdb.DuckDBPyConnection, where_sql: str) -> dict[str, Any] | None:
+def _choose_drug(
+    conn: duckdb.DuckDBPyConnection,
+    where_sql: str,
+    *,
+    order_by: str = "drug_name",
+) -> dict[str, Any] | None:
     df = _fetch_dataframe(
         conn,
         f"""
-        SELECT DISTINCT drug_name, ndc, tier_family, is_insulin, days_supply
+        SELECT
+            drug_name,
+            ndc,
+            rxcui,
+            tier_family,
+            is_insulin,
+            days_supply,
+            has_prior_auth,
+            has_step_therapy,
+            has_quantity_limit,
+            unit_cost
         FROM gold.plan_drug_cost_basis
         WHERE drug_name IS NOT NULL
           AND ndc IS NOT NULL
           AND {where_sql}
-        ORDER BY drug_name
+        ORDER BY {order_by}
         LIMIT 1
         """
     )
@@ -381,7 +407,7 @@ def _choose_drug(conn: duckdb.DuckDBPyConnection, where_sql: str) -> dict[str, A
 
 def _query_scenario_inputs(
     conn: duckdb.DuckDBPyConnection, config: PipelineConfig
-) -> tuple[list[dict[str, Any]], pd.DataFrame]:
+) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
     zipcode_limit = BASE_SCENARIO_COUNT["demo" if config.is_demo_profile else "full"]
     zip_df = _fetch_dataframe(
         conn,
@@ -401,48 +427,100 @@ def _query_scenario_inputs(
     generic_drug = _choose_drug(conn, "tier_family = 'generic'")
     brand_drug = _choose_drug(conn, "tier_family = 'brand' AND is_insulin = FALSE")
     insulin_drug = _choose_drug(conn, "is_insulin = TRUE")
-    fallback_drug = generic_drug or brand_drug or insulin_drug or _choose_drug(conn, "TRUE")
+    specialty_drug = _choose_drug(conn, "tier_family = 'specialty'", order_by="coalesce(unit_cost, 0) DESC, drug_name")
+    restricted_drug = _choose_drug(
+        conn,
+        "has_prior_auth = TRUE OR has_step_therapy = TRUE OR has_quantity_limit = TRUE",
+        order_by="coalesce(unit_cost, 0) DESC, drug_name",
+    )
+    fallback_drug = generic_drug or brand_drug or insulin_drug or specialty_drug or restricted_drug or _choose_drug(conn, "TRUE")
     generic_drug = generic_drug or fallback_drug
     brand_drug = brand_drug or fallback_drug
     insulin_drug = insulin_drug or brand_drug or fallback_drug
-    drugs = [item for item in [generic_drug, brand_drug, insulin_drug] if item]
-    if not drugs:
+    specialty_drug = specialty_drug or restricted_drug or brand_drug or insulin_drug or fallback_drug
+    restricted_drug = restricted_drug or specialty_drug or brand_drug or insulin_drug or fallback_drug
+    archetypes = {
+        "generic": generic_drug,
+        "brand": brand_drug,
+        "insulin": insulin_drug,
+        "specialty": specialty_drug,
+        "restricted": restricted_drug,
+    }
+    if not any(archetypes.values()):
         raise ValueError("No eligible drugs found in gold.plan_drug_cost_basis for scenario generation.")
-    return drugs, zip_df
+    return archetypes, zip_df
 
 
 def _build_default_scenarios(config: PipelineConfig) -> list[ScenarioSpec]:
     from .recommend import BeneficiaryInput, MedicationInput
 
     conn = _connect(config)
-    drugs, zip_df = _query_scenario_inputs(conn, config)
+    archetypes, zip_df = _query_scenario_inputs(conn, config)
     conn.close()
 
-    generic_drug = drugs[0]
-    brand_drug = drugs[1] if len(drugs) > 1 else drugs[0]
-    insulin_drug = drugs[2] if len(drugs) > 2 else brand_drug
-    approximate_name = str(generic_drug["drug_name"]).split()[0]
+    generic_drug = archetypes["generic"]
+    brand_drug = archetypes["brand"]
+    insulin_drug = archetypes["insulin"]
+    specialty_drug = archetypes["specialty"]
+    restricted_drug = archetypes["restricted"]
+
+    def _scenario_day_supply(drug: dict[str, Any] | None, default: int = 30) -> int:
+        try:
+            value = int(float((drug or {}).get("days_supply") or default))
+        except (TypeError, ValueError):
+            value = default
+        return value if value in {30, 60, 90} else default
+
+    def _medication_from_drug(
+        drug: dict[str, Any] | None,
+        *,
+        tier_family: str | None = None,
+        day_supply: int | None = None,
+    ) -> MedicationInput:
+        if not drug:
+            raise ValueError("Scenario generation could not find a reference drug.")
+        return MedicationInput(
+            drug_name=str(drug.get("drug_name") or ""),
+            rxcui=str(drug.get("rxcui") or "") or None,
+            ndc=str(drug.get("ndc") or "") or None,
+            tier_family=str(tier_family or drug.get("tier_family") or "brand"),
+            day_supply=day_supply or _scenario_day_supply(drug),
+        )
+
     scenarios: list[ScenarioSpec] = []
     templates = [
         (
-            "generic_only",
+            "low_generic",
             lambda zipcode: (
-                BeneficiaryInput(zipcode=zipcode, age_band="65-74", lis_status="none", pharmacy_preference="auto", top_n=1000),
-                [MedicationInput(drug_name=str(generic_drug["drug_name"]), tier_family="generic", day_supply=30)],
+                BeneficiaryInput(
+                    zipcode=zipcode,
+                    age_band="65-74",
+                    lis_status="none",
+                    pharmacy_preference="auto",
+                    top_n=1000,
+                    user_role="counselor",
+                    decision_focus="balanced",
+                ),
+                [_medication_from_drug(generic_drug, tier_family="generic", day_supply=30)],
             ),
         ),
         (
-            "mixed_brand_generic",
+            "maintenance_brand",
             lambda zipcode: (
-                BeneficiaryInput(zipcode=zipcode, age_band="75-84", lis_status="none", pharmacy_preference="auto", top_n=1000),
-                [
-                    MedicationInput(drug_name=str(generic_drug["drug_name"]), tier_family="generic", day_supply=30),
-                    MedicationInput(drug_name=str(brand_drug["drug_name"]), tier_family=str(brand_drug["tier_family"]), day_supply=30),
-                ],
+                BeneficiaryInput(
+                    zipcode=zipcode,
+                    age_band="75-84",
+                    lis_status="none",
+                    pharmacy_preference="auto",
+                    top_n=1000,
+                    user_role="counselor",
+                    decision_focus="coverage_first",
+                ),
+                [_medication_from_drug(brand_drug, day_supply=90)],
             ),
         ),
         (
-            "insulin_heavy",
+            "insulin_only",
             lambda zipcode: (
                 BeneficiaryInput(
                     zipcode=zipcode,
@@ -451,62 +529,65 @@ def _build_default_scenarios(config: PipelineConfig) -> list[ScenarioSpec]:
                     pharmacy_preference="auto",
                     chronic_condition_flags=["diabetes"],
                     top_n=1000,
+                    user_role="counselor",
+                    decision_focus="coverage_first",
                 ),
-                [
-                    MedicationInput(drug_name=str(insulin_drug["drug_name"]), tier_family="brand", day_supply=30),
-                    MedicationInput(drug_name=str(generic_drug["drug_name"]), tier_family="generic", day_supply=30),
-                ],
+                [_medication_from_drug(insulin_drug, tier_family="brand", day_supply=30)],
             ),
         ),
         (
-            "mail_order_favored",
-            lambda zipcode: (
-                BeneficiaryInput(zipcode=zipcode, age_band="75-84", lis_status="none", pharmacy_preference="mail", top_n=1000),
-                [MedicationInput(drug_name=str(brand_drug["drug_name"]), tier_family=str(brand_drug["tier_family"]), day_supply=90)],
-            ),
-        ),
-        (
-            "high_deductible",
-            lambda zipcode: (
-                BeneficiaryInput(zipcode=zipcode, age_band="85+", lis_status="none", pharmacy_preference="retail", top_n=1000),
-                [
-                    MedicationInput(drug_name=str(brand_drug["drug_name"]), tier_family=str(brand_drug["tier_family"]), day_supply=30),
-                    MedicationInput(drug_name=str(generic_drug["drug_name"]), tier_family="generic", day_supply=30),
-                ],
-            ),
-        ),
-        (
-            "partial_coverage",
-            lambda zipcode: (
-                BeneficiaryInput(zipcode=zipcode, age_band="75-84", lis_status="none", pharmacy_preference="auto", top_n=1000),
-                [
-                    MedicationInput(drug_name=str(brand_drug["drug_name"]), tier_family=str(brand_drug["tier_family"]), day_supply=30),
-                    MedicationInput(drug_name=str(insulin_drug["drug_name"]), tier_family="brand", day_supply=30),
-                ],
-            ),
-        ),
-        (
-            "approximate_match",
-            lambda zipcode: (
-                BeneficiaryInput(zipcode=zipcode, age_band="65-74", lis_status="full", pharmacy_preference="auto", top_n=1000),
-                [MedicationInput(drug_name=approximate_name, tier_family="generic", day_supply=30)],
-            ),
-        ),
-        (
-            "multi_drug_chronic_regimen",
+            "insulin_plus_chronic",
             lambda zipcode: (
                 BeneficiaryInput(
                     zipcode=zipcode,
                     age_band="75-84",
                     lis_status="partial",
                     pharmacy_preference="auto",
-                    chronic_condition_flags=["diabetes", "copd", "heart_failure"],
+                    chronic_condition_flags=["diabetes", "heart_failure"],
                     top_n=1000,
+                    user_role="counselor",
+                    decision_focus="coverage_first",
                 ),
                 [
-                    MedicationInput(drug_name=str(generic_drug["drug_name"]), tier_family="generic", day_supply=30),
-                    MedicationInput(drug_name=str(brand_drug["drug_name"]), tier_family=str(brand_drug["tier_family"]), day_supply=30),
-                    MedicationInput(drug_name=str(insulin_drug["drug_name"]), tier_family="brand", day_supply=30),
+                    _medication_from_drug(insulin_drug, tier_family="brand", day_supply=30),
+                    _medication_from_drug(generic_drug, tier_family="generic", day_supply=30),
+                    _medication_from_drug(brand_drug, day_supply=30),
+                ],
+            ),
+        ),
+        (
+            "specialty_high_cost",
+            lambda zipcode: (
+                BeneficiaryInput(
+                    zipcode=zipcode,
+                    age_band="75-84",
+                    lis_status="none",
+                    pharmacy_preference="auto",
+                    top_n=1000,
+                    user_role="counselor",
+                    decision_focus="coverage_first",
+                ),
+                [
+                    _medication_from_drug(specialty_drug, tier_family="specialty", day_supply=30),
+                    _medication_from_drug(restricted_drug, day_supply=30),
+                ],
+            ),
+        ),
+        (
+            "rural_access_sensitive",
+            lambda zipcode: (
+                BeneficiaryInput(
+                    zipcode=zipcode,
+                    age_band="85+",
+                    lis_status="none",
+                    pharmacy_preference="retail",
+                    top_n=1000,
+                    user_role="counselor",
+                    decision_focus="coverage_first",
+                ),
+                [
+                    _medication_from_drug(brand_drug, day_supply=30),
+                    _medication_from_drug(generic_drug, tier_family="generic", day_supply=30),
                 ],
             ),
         ),
@@ -677,6 +758,23 @@ def _monthly_cost_variance_features(recommendation: Any) -> dict[str, float]:
     }
 
 
+def _fallback_group_for_recommendation(recommendation: Any) -> str:
+    if recommendation.coverage_status == "full":
+        return "full_coverage"
+    unsafe_reasons = {str(value) for value in getattr(recommendation, "unsafe_reasons", [])}
+    if recommendation.network_flag == "unknown" or "unknown_network_data" in unsafe_reasons:
+        return "network_unknown"
+    if (
+        recommendation.network_flag in {"no_preferred_retail", "limited_preferred_retail"}
+        or "long_preferred_distance" in unsafe_reasons
+        or "no_usable_channel" in unsafe_reasons
+    ):
+        return "access_blocked"
+    if recommendation.priced_drug_count == 0 or recommendation.uncovered_drug_count >= len(recommendation.drug_breakdowns):
+        return "never_local_coverable"
+    return "not_jointly_coverable"
+
+
 def _recommendations_to_feature_rows(
     conn: duckdb.DuckDBPyConnection,
     recommendations: list[Any],
@@ -708,6 +806,10 @@ def _recommendations_to_feature_rows(
     rec_feature_lookup = {
         str(row["plan_key"]): row for row in rec_features.to_dict("records")
     }
+    candidate_plan_count_service_area = float(len(recommendations))
+    candidate_plan_count_ranked = float(len(recommendations))
+    plans_with_unknown_network_count = float(sum(1 for item in recommendations if item.network_flag == "unknown"))
+    plans_dropped_due_to_missing_data = max(0.0, candidate_plan_count_service_area - candidate_plan_count_ranked)
 
     rows: list[dict[str, Any]] = []
     for recommendation in recommendations:
@@ -780,6 +882,8 @@ def _recommendations_to_feature_rows(
             "preferred_match_count": match_summary["preferred_match_count"],
             "network_flag": recommendation.network_flag,
             "network_risk_score": NETWORK_RISK_MAP.get(recommendation.network_flag, 1.0),
+            "scenario_profile": str(getattr(recommendation, "scenario_profile", "") or "low_utilizer"),
+            "fallback_group": _fallback_group_for_recommendation(recommendation),
             "lis_status": beneficiary.lis_status,
             "age_band": beneficiary.age_band,
             "pharmacy_preference": beneficiary.pharmacy_preference,
@@ -802,6 +906,13 @@ def _recommendations_to_feature_rows(
             "benefit_design": recommendation.benefit_design,
             "simulation_policy": recommendation.simulation_policy,
             "feature_version": recommendation.feature_version,
+            "match_review_required_flag": float(1 if getattr(recommendation, "match_review_required", False) else 0),
+            "unknown_network_data_flag": float(1 if recommendation.network_flag == "unknown" else 0),
+            "unsafe_reason_count": float(len(getattr(recommendation, "unsafe_reasons", []) or [])),
+            "candidate_plan_count_service_area": candidate_plan_count_service_area,
+            "candidate_plan_count_ranked": candidate_plan_count_ranked,
+            "plans_with_unknown_network_count": plans_with_unknown_network_count,
+            "plans_dropped_due_to_missing_data": plans_dropped_due_to_missing_data,
         }
         rows.append(row)
     return rows
@@ -819,15 +930,27 @@ def build_training_dataset(
     conn = _connect(active_config)
     synthetic_scenarios = _filter_scenarios(_build_synthetic_scenarios(conn, active_config), scenario_bundles)
     fallback_scenarios = _filter_scenarios(_build_default_scenarios(active_config), scenario_bundles)
-    scenarios = synthetic_scenarios if synthetic_scenarios else fallback_scenarios
+    if synthetic_scenarios and len(synthetic_scenarios) >= SCENARIO_PRECISION_TARGET:
+        scenarios = synthetic_scenarios
+        scenario_source = "synthetic"
+    elif synthetic_scenarios:
+        scenarios = synthetic_scenarios + fallback_scenarios
+        scenario_source = "synthetic_plus_default"
+    else:
+        scenarios = fallback_scenarios
+        scenario_source = "default"
     rows: list[dict[str, Any]] = []
     for scenario in scenarios:
-        recommendations = recommend_plans(
-            scenario.beneficiary,
-            scenario.medications,
-            config=active_config,
-            ranking_mode="rules",
-        )
+        try:
+            recommendations = recommend_plans(
+                scenario.beneficiary,
+                scenario.medications,
+                config=active_config,
+                ranking_mode="rules",
+            )
+        except ValueError as exc:
+            logger.warning("skipping scenario %s during dataset build: %s", scenario.scenario_id, exc)
+            continue
         rows.extend(
             _recommendations_to_feature_rows(
                 conn,
@@ -865,7 +988,7 @@ def build_training_dataset(
         "scenario_bundles": sorted(frame["scenario_bundle"].unique().tolist()),
         "snapshot_quarter": active_config.snapshot_quarter,
         "build_profile": active_config.build_profile,
-        "scenario_source": "synthetic" if synthetic_scenarios else "default",
+        "scenario_source": scenario_source,
     }
     metadata_path = _dataset_metadata_path(path)
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -1218,10 +1341,17 @@ def _collect_system_metrics(
                 ordered = group.sort_values(["coverage_status", score_column], ascending=[True, False]).copy()
             ordered_keys = ordered["plan_key"].tolist()
             relevances = [truth_relevance_map[key] for key in ordered_keys]
+            top1 = ordered.head(1)
             top5 = ordered.head(5)
             top10 = ordered.head(10)
+            truth_top1 = truth.head(1)
+            no_full_coverage_truth = bool((truth["coverage_status"] != "full").all())
+            blocker_precision = 1.0
+            if no_full_coverage_truth and not top1.empty and not truth_top1.empty:
+                blocker_precision = float(top1.iloc[0]["fallback_group"] == truth_top1.iloc[0]["fallback_group"])
             metrics = {
                 "top1_agreement": 1.0 if ordered_keys[:1] == truth_plan_keys[:1] else 0.0,
+                "top1_full_coverage_rate": float((top1["coverage_status"] == "full").mean()) if not top1.empty else 0.0,
                 "top5_overlap": _top_overlap(ordered_keys, truth_plan_keys, 5),
                 "top10_overlap": _top_overlap(ordered_keys, truth_plan_keys, 10),
                 "ndcg_5": _ndcg_at_k(relevances, 5),
@@ -1231,6 +1361,18 @@ def _collect_system_metrics(
                 "top5_avg_total_cost": float(top5["annual_total_cost"].mean()) if not top5.empty else 0.0,
                 "top10_avg_total_cost": float(top10["annual_total_cost"].mean()) if not top10.empty else 0.0,
                 "top5_avg_uncovered": float(top5["uncovered_drug_count"].mean()) if not top5.empty else 0.0,
+                "blocker_classification_precision": blocker_precision,
+                "match_review_trigger_rate": float(top5["match_review_required_flag"].mean()) if not top5.empty else 0.0,
+                "plans_dropped_due_to_missing_data": float(
+                    ordered["plans_dropped_due_to_missing_data"].max()
+                )
+                if not ordered.empty
+                else 0.0,
+                "pct_runs_with_unknown_network_data": float(
+                    (ordered["unknown_network_data_flag"] > 0).any()
+                )
+                if not ordered.empty
+                else 0.0,
             }
             overall[system_name].append(metrics)
             by_bundle[bundle][system_name].append(metrics)

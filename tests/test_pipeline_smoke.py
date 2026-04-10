@@ -224,6 +224,8 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert recommendations[0].fit_score >= recommendations[1].fit_score
     assert recommendations[0].fit_label
     assert recommendations[0].fit_summary
+    assert recommendations[0].scenario_profile
+    assert recommendations[0].match_review_required is False
     assert recommendations[0].monthly_cost_estimate == round(recommendations[0].annual_total_cost / 12, 2)
     assert recommendations[0].feature_version == "research_v4"
     assert recommendations[0].contract_year == 2025
@@ -244,6 +246,7 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert recommendations[0].drug_breakdowns[0].coverage_gap_flag is False
     assert recommendations[1].drug_breakdowns[1].coverage_status == "excluded"
     assert recommendations[1].explanation_groups.coverage_issues
+    assert "uncovered_exact_drug" in recommendations[1].unsafe_reasons
 
     bundle = recommend_plan_bundle(beneficiary, medications, config=config)
     assert bundle.summary.requested_drug_count == 2
@@ -251,6 +254,10 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert bundle.summary.local_full_coverage_count == 1
     assert bundle.summary.local_partial_count == 1
     assert bundle.summary.fallback_reason == "none"
+    assert bundle.summary.scenario_profile == recommendations[0].scenario_profile
+    assert bundle.summary.candidate_plan_count_service_area == 2
+    assert bundle.summary.candidate_plan_count_ranked == 2
+    assert bundle.summary.plans_with_unknown_network_count == 0
     assert [item.plan_name for item in bundle.full_coverage_plans] == ["Plan A"]
     assert bundle.partial_fallback_plans == []
     assert bundle.blocked_medications == []
@@ -323,6 +330,9 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
         "priced_drug_share",
         "monthly_drug_oop_variance",
         "monthly_total_variance",
+        "scenario_profile",
+        "match_review_required_flag",
+        "unknown_network_data_flag",
     }.issubset(dataset_frame.columns)
     assert len(dataset_frame) > 0
 
