@@ -5,7 +5,7 @@ Counselor-first Medicare Part D recommendation platform built on a DuckDB medall
 This project combines:
 
 - the DuckDB extraction, build, rules engine, hybrid reranker, CLI, and smoke-test foundation from `Medicare-PartD-Recommendation`
-- the counselor workflow, trust and evidence framing, synthetic PDE-compatible beneficiary generation, and research views from `CMS-Medicare-PartD-Recommendation`
+- the counselor workflow, trust and evidence framing, canonical mixed-source scenario generation, and research views from `CMS-Medicare-PartD-Recommendation`
 
 The result is a new standalone project named `CMS-MPD-Recommendation` with package name `cms_mpd`.
 
@@ -20,7 +20,7 @@ Detailed technical reference:
 - ingests local CMS SPUF 2025 Q3 source files into `bronze.*`
 - normalizes reusable entities into `silver.*`
 - materializes `gold.*` serving assets for the recommendation engine, model dataset builder, and Streamlit app
-- generates PDE-compatible synthetic beneficiaries into `synthetic.*`
+- materializes canonical mixed-source training scenarios into `synthetic.*`
 - estimates annual premium, annual drug OOP, and annual total cost for plan comparison
 - ranks top 5 or top 10 plans with rules-first logic and an optional hybrid reranker
 - defaults to the 2025 redesigned Part D benefit for `2025-Q3` data and supports explicit `2024_standard` historical modeling when needed
@@ -109,6 +109,9 @@ Synthetic research and training support:
 
 - `synthetic.syn_beneficiary`
 - `synthetic.syn_beneficiary_prescriptions`
+- `synthetic.training_scenarios`
+- `synthetic.training_scenario_medications`
+- `synthetic.training_scenario_manifest`
 
 ## Input Contracts
 
@@ -265,9 +268,9 @@ PowerShell-friendly alternative:
   --medication-file ".\\medications.json"
 ```
 
-## Synthetic Beneficiary Generation
+## Scenario Generation
 
-Generate synthetic beneficiaries and prescriptions into the DuckDB `synthetic` schema:
+Legacy beneficiary generation remains available for raw-support tables:
 
 ```powershell
 .venv\Scripts\python.exe scripts\generate_beneficiary_profiles.py --num-beneficiaries 250
@@ -279,27 +282,53 @@ Use PDE-derived scenarios:
 .venv\Scripts\python.exe scripts\generate_beneficiary_profiles.py --from-pde
 ```
 
+Canonical training scenarios are now first-class:
+
+```powershell
+.venv\Scripts\python.exe -m cms_mpd generate-scenarios `
+  --scenario-source-strategy mixed `
+  --target-scenario-count 600 `
+  --generator-seed 42 `
+  --refresh-scenarios
+```
+
 ## Hybrid Dataset and Model Workflow
 
-Build the training dataset:
+Build the training dataset from canonical scenarios:
 
 ```powershell
-.venv\Scripts\python.exe -m cms_mpd build-dataset
+.venv\Scripts\python.exe -m cms_mpd build-dataset `
+  --scenario-source-strategy mixed `
+  --target-scenario-count 600 `
+  --generator-seed 42 `
+  --max-workers 4 `
+  --chunk-size 10 `
+  --stale-chunk-hours 6
 ```
 
-Train the tree reranker:
+The dataset build is now ZIP-grouped, chunked, and resumable. Intermediate chunk files are written under `data/training/<snapshot>/<profile>/hybrid_reranker_dataset.chunks/`, so if a long run is interrupted you can resume with the same command instead of losing completed work. Use `--no-resume-chunks` only when you intentionally want to rebuild the chunk set from scratch. Stale `started` chunks are cleaned up after the configured `--stale-chunk-hours` threshold.
+
+Train the tree reranker with the default student-safe feature policy:
 
 ```powershell
-.venv\Scripts\python.exe -m cms_mpd train-model --model-type tree --feature-subset full
+.venv\Scripts\python.exe -m cms_mpd train-model `
+  --model-type tree `
+  --feature-subset full `
+  --teacher-feature-policy student_safe
 ```
 
-Evaluate rules, heuristic baseline, and rerankers:
+Evaluate rules, heuristic baseline, and rerankers across scenario, ZIP, and regimen-held-out splits:
 
 ```powershell
-.venv\Scripts\python.exe -m cms_mpd evaluate-model
+.venv\Scripts\python.exe -m cms_mpd evaluate-model `
+  --teacher-feature-policy student_safe
 ```
 
-Evaluation uses a held-out scenario split so the reported reranker metrics are measured on scenarios that were not used for fitting.
+Evaluation reports all three split modes:
+
+- held-out by scenario
+- held-out by beneficiary ZIP
+- held-out by regimen signature
 
 Generated assets live under:
 

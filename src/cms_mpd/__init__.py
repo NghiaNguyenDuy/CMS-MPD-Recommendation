@@ -65,6 +65,7 @@ from .research_eval import (
     subgroup_frames,
     systems_summary_frame,
 )
+from .scenario_generation import generate_training_scenarios
 
 __all__ = [
     "AlternativeSearchTerm",
@@ -106,6 +107,7 @@ __all__ = [
     "ensure_research_artifacts",
     "evaluate_hybrid_reranker",
     "extract_sources",
+    "generate_training_scenarios",
     "haversine_miles",
     "health_check",
     "load_hybrid_reranker",

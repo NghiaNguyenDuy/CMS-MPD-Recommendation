@@ -9,7 +9,7 @@ tags:
   - project-review
   - methods
 created: 2026-04-07
-updated: 2026-04-10
+updated: 2026-04-11
 related_notes:
   - "[[CMS MPD Recommendation - Data Lineage Table]]"
   - "[[CMS MPD Recommendation - Journal Manuscript Draft]]"
@@ -80,7 +80,8 @@ RXCUI shards + reference CSVs"]
 rules-first fill-level simulation"]
     H --> I["Decision support outputs
 CLI + Streamlit + audit exports"]
-    G --> J["synthetic.* or PDE-compatible scenarios"]
+    G --> J["canonical mixed-source scenarios
+synthetic.training_*"]
     H --> K["Training dataset build
 scenario replay -> feature rows"]
     J --> K
@@ -99,9 +100,10 @@ research-mode summaries"]
 2. `extract.py` finds CMS archives and reference files, then extracts archive members to `data/staging/<snapshot>/raw`.
 3. `pipeline.py` builds `bronze`, `silver`, `gold`, and ensures `synthetic` exists.
 4. `recommend.py` reads the gold serving layer, simulates fill-level cost, and returns ranked plans with explanation groups and fill traces.
-5. `scripts/generate_beneficiary_profiles.py` optionally populates synthetic or PDE-compatible scenario tables.
-6. `modeling.py` replays recommendation scenarios into a feature dataset, computes weak labels, fits rerankers, and evaluates them.
-7. `research_eval.py` reshapes evaluation outputs for research mode.
+5. `scenario_generation.py` materializes canonical mixed-source scenarios in `synthetic.training_scenarios`, `synthetic.training_scenario_medications`, and `synthetic.training_scenario_manifest`.
+6. `scripts/generate_beneficiary_profiles.py` remains available for legacy raw-support `synthetic.syn_*` tables.
+7. `modeling.py` replays canonical recommendation scenarios into a feature dataset, computes weak labels, fits rerankers, and evaluates them.
+8. `research_eval.py` reshapes evaluation outputs for research mode.
 
 ## 3. Data Logic and Transformation
 
@@ -585,20 +587,20 @@ together with simulated annual cost, coverage, access, and utilization-managemen
 
 ### 5.1 Scenario construction
 
-The scenario pool is constructed from either synthetic beneficiary records or a deterministic benchmark generator. If the synthetic pool is sufficiently large, it is used directly; otherwise, the benchmark generator supplies a fixed set of scenario bundles spanning the main counseling situations the system is intended to support:
+The current implementation no longer builds the dataset from an implicit fallback chain. It first materializes a canonical scenario layer in `synthetic.training_*`, then replays the recommendation engine over that layer. The default strategy is mixed-source generation, combining PDE-grounded scenarios, benchmark scenarios, and stress scenarios under the current recommender taxonomy:
 
-- `low_generic`
-- `maintenance_brand`
-- `insulin_only`
-- `insulin_plus_chronic`
+- `low_utilizer`
+- `maintenance_generic`
+- `insulin_chronic`
 - `specialty_high_cost`
-- `rural_access_sensitive`
+- `mixed_restriction`
+- `access_sensitive`
 
-In the current rebuilt local state, the dataset is generated from the default benchmark pool and contains `300` scenarios.
+Under the default full build, the generator targets `600` scenarios total, or `100` per canonical bundle, with a `50 / 30 / 20` mix of PDE-grounded, benchmark, and stress scenarios. ZIP assignment is stratified rather than based on the first available ZIPs, and the manifest records bundle counts, source-kind counts, diversity diagnostics, and intended-profile match rates.
 
 #### Dataset build sequence
 
-The training dataset is constructed by replaying the live recommendation engine over each scenario rather than by reading a pre-labeled table. Let $s \in \mathcal{S}$ denote one beneficiary-regimen scenario and let
+The training dataset is constructed by replaying the live recommendation engine over each materialized canonical scenario rather than by reading a pre-labeled table. Let $s \in \mathcal{S}$ denote one beneficiary-regimen scenario and let
 
 $$
 \mathcal{P}_s = \mathrm{Recommend}(s)
@@ -624,7 +626,7 @@ $$
 
 where each tuple is created in four steps:
 
-1. build a beneficiary profile and medication list for scenario $s$;
+1. materialize a canonical beneficiary profile and medication list for scenario $s$ in `synthetic.training_*`;
 2. execute `recommend_plans(...)` in rules mode on the ZIP-eligible candidate set for $s$;
 3. flatten each returned `PlanRecommendation` into one scenario-plan feature row $\mathbf{x}_{s,p}$;
 4. compute the weak supervisory score $\tilde{y}_{s,p}$ and scenario-local relevance label $\mathrm{rel}_{s,p}$.
@@ -636,6 +638,28 @@ $$
 $$
 
 Methodologically, this choice matters because the reranker is being trained to reorder plans within a beneficiary-specific choice set. It is not being trained to predict an absolute plan-quality label in isolation from the scenario that generated it.
+
+As of April 11, 2026, the replay builder itself is chunked and resumable. Instead of holding all feature rows in memory until the end of the run, the implementation now partitions the scenario set into persisted chunk files under `data/training/<snapshot>/<profile>/hybrid_reranker_dataset.chunks/`. Each chunk replays a bounded scenario subset, writes a chunk CSV plus a chunk metadata file, and updates a build manifest. This change serves two purposes. First, it reduces long-run fragility on Windows multiprocessing workflows by keeping worker lifetimes shorter and recycling chunk tasks rather than relying on one monolithic process pool for the full national scenario set. Second, it turns the dataset build into a restartable pipeline:
+
+$$
+\mathcal{D}
+=
+\bigcup_{c=1}^{C} \mathcal{D}_c,
+\qquad
+\mathcal{D}_c
+=
+\bigcup_{s \in \mathcal{S}_c}
+\bigcup_{p \in \mathcal{P}_s}
+\left\{
+\left(
+\mathbf{x}_{s,p},
+\tilde{y}_{s,p},
+\mathrm{rel}_{s,p}
+\right)
+\right\},
+$$
+
+where $\mathcal{S}_c$ is the set of scenarios assigned to chunk $c$. If a long run is interrupted, the builder resumes from the completed chunk manifest rather than discarding already materialized rows.
 
 ### 5.2 Feature-row construction
 
@@ -730,11 +754,11 @@ Two reranker families are fitted:
 - a linear ridge-regression model over encoded numeric and categorical features;
 - a small additive tree ensemble that captures non-linear interactions.
 
-Both models are trained to predict $\tilde{y}_{s,p}$ from $\mathbf{x}_{s,p}$. The saved artifact stores the feature schema, weak-label version, dataset schema version, feature version, and training metadata so that the learned model remains traceable to the exact dataset configuration used at fit time.
+Both models are trained to predict $\tilde{y}_{s,p}$ from $\mathbf{x}_{s,p}$. Teacher features such as the live rules rank, rules score, and fit sub-scores are retained in the dataset for audit, but the default training policy excludes them from the model feature set so that the reranker does not directly learn on the teacher outputs it is trying to refine. The saved artifact stores the feature schema, weak-label version, dataset schema version, feature version, teacher-feature policy, and training metadata so that the learned model remains traceable to the exact dataset configuration used at fit time.
 
 ### 5.5 Held-out-by-scenario evaluation
 
-Evaluation uses a scenario-level split rather than a row-level split. Formally, the scenario set is partitioned into disjoint training and test subsets,
+Evaluation now reports three held-out modes rather than a single split: by scenario, by beneficiary ZIP, and by regimen signature. The primary report remains scenario-held-out, but ZIP-held-out and regimen-held-out splits are produced alongside it to give a more credible picture of generalization under geographic and regimen novelty. Formally, for each split mode the scenario-derived row set is partitioned into disjoint training and test subsets,
 
 $$
 \mathcal{S}=\mathcal{S}_{\mathrm{train}} \cup \mathcal{S}_{\mathrm{test}},
@@ -1016,19 +1040,22 @@ Blocked-drug alternatives now behave more conservatively and more precisely:
 
 The modeling workflow now reflects the same implementation assumptions:
 
-- the default benchmark generator was reworked into six scenario bundles:
-  - `low_generic`
-  - `maintenance_brand`
-  - `insulin_only`
-  - `insulin_plus_chronic`
+- canonical scenario generation now materializes `synthetic.training_scenarios`, `synthetic.training_scenario_medications`, and `synthetic.training_scenario_manifest` before dataset replay;
+- the canonical bundle taxonomy now matches the live recommender scenario profiles:
+  - `low_utilizer`
+  - `maintenance_generic`
+  - `insulin_chronic`
   - `specialty_high_cost`
-  - `rural_access_sensitive`
+  - `mixed_restriction`
+  - `access_sensitive`
+- the default generation strategy is now `mixed`, combining PDE-grounded, benchmark, and stress scenarios under the canonical bundle taxonomy;
 - feature rows now capture scenario profile, match-review flags, unknown-network flags, unsafe-reason counts, and candidate-plan counts;
+- teacher features remain in the dataset for audit, but the default training policy is now `student_safe`, which excludes direct teacher outputs from the model feature set;
 - evaluation summaries now report scenario-sensitive outcomes such as full-coverage rates, blocker-classification precision proxy, match-review trigger rate, and runs affected by unknown network data.
 
-### Rebuilt Artifact State
+### Rebuilt Artifact And Replay State
 
-The local DuckDB artifact, training dataset, and reranker artifacts were rebuilt on April 9, 2026 from the staged `2025-Q3` raw files under `data/staging/`.
+The local DuckDB artifact, canonical scenario layer, training dataset, and reranker artifacts were rebuilt on April 11, 2026 from the staged `2025-Q3` raw files under `data/staging/`.
 
 #### Database rebuild status
 
@@ -1045,24 +1072,46 @@ The remaining `gold.plan_formulary_summary` versus `gold.plan_summary` delta of 
 
 #### Training dataset sync
 
-The training dataset was rebuilt after the database refresh and is now aligned with the current code:
+The training dataset was rebuilt after the database refresh and replay-optimization pass and is now aligned with the current code:
 
 - dataset schema: `request_features_v4`
 - feature version: `research_v4`
-- row count: `16116`
-- scenario count: `300`
-- scenario source: `default`
+- weak-label version: `weak_label_v2`
+- row count: `33961`
+- scenario count: `600`
+- scenario source: `mixed`
+- teacher-feature policy: `student_safe`
+- chunk manifest version: `dataset_chunks_v2`
+- chunk count: `88`
+- chunk size: `10`
+- ZIP-grouped chunks: `true`
 
-The rebuilt benchmark bundles are:
+The rebuilt canonical bundles are:
 
-- `low_generic`
-- `maintenance_brand`
-- `insulin_only`
-- `insulin_plus_chronic`
+- `low_utilizer`
+- `maintenance_generic`
+- `insulin_chronic`
 - `specialty_high_cost`
-- `rural_access_sensitive`
+- `mixed_restriction`
+- `access_sensitive`
 
-This means `data/training/2025-Q3/full/` is no longer carrying the earlier `request_features_v2` mismatch that existed before the rebuild.
+This means `data/training/2025-Q3/full/` is no longer carrying the earlier benchmark-only fallback path. The dataset is now built from canonical mixed-source scenarios and stored through a resumable chunk manifest.
+
+#### Replay optimization status
+
+The replay builder now preserves exact dataset semantics while avoiding repeated DuckDB work across similar scenarios:
+
+- chunks are planned by ZIP before replay, so scenarios sharing a ZIP reuse prefetched candidate-plan, channel-summary, and nearest-distance context;
+- each worker now builds read-only caches for canonical drug references, drug-input defaults, dominant tier lookups, ZIP candidate plans, ZIP channel summaries, and ZIP-plus-drug cost-basis rows;
+- chunk output is persisted under `data/training/2025-Q3/full/hybrid_reranker_dataset.chunks/` as one CSV plus one metadata JSON per chunk, with a manifest that tracks `pending`, `started`, `completed`, and `failed` status;
+- stale `started` chunks are cleaned up by default after `6` hours;
+- Windows worker recycling now uses one chunk per child process (`max_tasks_per_child = 1`) to reduce long-lived worker stalls.
+
+Measured local build behavior on April 11, 2026:
+
+- full `600`-scenario mixed build with `4` workers and `10`-scenario chunks completed in about `632` seconds;
+- the earlier pre-optimization full build had taken about `5462` seconds;
+- rerunning the same command after completion reused all `88` chunks and rewrote the final dataset in about `8.45` seconds.
 
 #### Model artifact sync
 
@@ -1075,8 +1124,9 @@ Both artifacts now report:
 
 - dataset schema: `request_features_v4`
 - feature version: `research_v4`
-- training rows: `16116`
-- scenario count: `300`
+- training rows: `33961`
+- scenario count: `600`
+- teacher-feature policy: `student_safe`
 
 The evaluation report in `data/training/2025-Q3/full/hybrid_reranker_evaluation_tree.json` was also refreshed from the rebuilt dataset and new artifacts.
 
@@ -1086,10 +1136,20 @@ The refreshed evaluation report shows:
 
 - `top5_improved = true`
 - `top10_improved = true`
-- `uncovered_not_worse = true`
+- `uncovered_not_worse = false`
+
+For the current harder mixed-source dataset, the tree reranker improves ranking alignment but no longer satisfies the original no-worse uncovered-drug acceptance check:
+
+- tree reranker top-1 agreement: `0.8611`
+- tree reranker top-5 overlap: `0.9344`
+- tree reranker top-10 overlap: `0.9622`
+- tree reranker top-5 average uncovered drugs: `0.4589`
+- rules-only top-5 average uncovered drugs: `0.4144`
 
 One metric still needs careful interpretation:
 
 - `pct_runs_with_unknown_network_data = 1.0`
 
 In the rebuilt state, this no longer means network-summary rows are missing. It now means at least one plan in many evaluated scenarios is legitimately labeled with `network_flag = 'unknown'` as a modeled access state, not that the underlying plan was dropped or left null by the pipeline.
+
+The practical implication is that the replay and artifact pipeline is now synchronized and much faster, but the reranker itself still needs another tuning pass on the harder mixed-source dataset if we want the final acceptance criteria to hold again.

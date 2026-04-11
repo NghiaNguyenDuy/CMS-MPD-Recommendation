@@ -410,6 +410,26 @@ class RecommendationBundle:
     alternative_search_terms: list[AlternativeSearchTerm]
 
 
+@dataclass(slots=True)
+class DrugReferenceCache:
+    rows: list[dict[str, Any]]
+    by_ndc: dict[str, list[dict[str, Any]]]
+    by_rxcui: dict[str, list[dict[str, Any]]]
+
+
+@dataclass(slots=True)
+class RecommendationQueryContext:
+    candidate_plans: pd.DataFrame | None = None
+    channel_df: pd.DataFrame | None = None
+    nearest_distances: dict[str, float | None] | None = None
+    basis_df: pd.DataFrame | None = None
+    reference_cache: DrugReferenceCache | None = None
+    local_drug_metadata: dict[str, dict[str, Any]] | None = None
+    defaults_specific_lookup: dict[tuple[str, int, str], dict[str, Any]] | None = None
+    defaults_fallback_lookup: dict[tuple[int, str], dict[str, Any]] | None = None
+    tier_lookup: dict[tuple[str, int], str] | None = None
+
+
 def _normalize_days_supply(day_supply: int) -> int:
     if day_supply in SUPPORTED_DAYS_SUPPLY:
         return day_supply
@@ -827,6 +847,154 @@ def _canonical_drug_reference_frame(conn: duckdb.DuckDBPyConnection) -> pd.DataF
     )
 
 
+def build_drug_reference_cache(conn: duckdb.DuckDBPyConnection) -> DrugReferenceCache:
+    frame = _canonical_drug_reference_frame(conn)
+    rows: list[dict[str, Any]] = []
+    by_ndc: dict[str, list[dict[str, Any]]] = {}
+    by_rxcui: dict[str, list[dict[str, Any]]] = {}
+    for row in frame.to_dict("records"):
+        candidate_row = dict(row)
+        candidate_row["preferred_name_lower"] = str(candidate_row.get("preferred_name") or "").strip().lower()
+        candidate_row["synonym_lower"] = str(candidate_row.get("synonym") or "").strip().lower()
+        candidate_row["normalized_name"] = _normalize_drug_search_text(candidate_row.get("preferred_name"))
+        candidate_row["normalized_synonym"] = _normalize_drug_search_text(candidate_row.get("synonym"))
+        rows.append(candidate_row)
+        ndc = str(candidate_row.get("ndc") or "")
+        rxcui = str(candidate_row.get("rxcui") or "")
+        by_ndc.setdefault(ndc, []).append(candidate_row)
+        by_rxcui.setdefault(rxcui, []).append(candidate_row)
+    return DrugReferenceCache(rows=rows, by_ndc=by_ndc, by_rxcui=by_rxcui)
+
+
+def fetch_candidate_plans(
+    conn: duckdb.DuckDBPyConnection,
+    zipcode: str,
+) -> pd.DataFrame:
+    return _fetch_dataframe(conn, _candidate_plan_query(conn), [zipcode])
+
+
+def fetch_basis_rows(
+    conn: duckdb.DuckDBPyConnection,
+    plan_keys: list[str],
+    ndcs: list[str],
+) -> pd.DataFrame:
+    if not plan_keys or not ndcs:
+        return pd.DataFrame()
+    placeholders = ", ".join("?" for _ in plan_keys)
+    ndc_placeholders = ", ".join("?" for _ in ndcs)
+    return _fetch_dataframe(
+        conn,
+        f"""
+        SELECT *
+        FROM gold.plan_drug_cost_basis
+        WHERE plan_key IN ({placeholders})
+          AND ndc IN ({ndc_placeholders})
+        """,
+        plan_keys + ndcs,
+    )
+
+
+def fetch_channel_summaries(
+    conn: duckdb.DuckDBPyConnection,
+    plan_keys: list[str],
+) -> pd.DataFrame:
+    if not plan_keys:
+        return pd.DataFrame()
+    placeholders = ", ".join("?" for _ in plan_keys)
+    return _fetch_dataframe(
+        conn,
+        f"SELECT * FROM gold.plan_channel_summary WHERE plan_key IN ({placeholders})",
+        plan_keys,
+    )
+
+
+def build_local_drug_metadata_from_basis(
+    basis_df: pd.DataFrame,
+) -> dict[str, dict[str, Any]]:
+    if basis_df.empty:
+        return {}
+    lookup: dict[str, dict[str, Any]] = {}
+    for ndc, group in basis_df.groupby("ndc", dropna=False):
+        ndc_key = str(ndc or "")
+        day_supply_options = sorted(
+            {
+                int(float(value))
+                for value in group["days_supply"].dropna().tolist()
+            }
+        )
+        tier_options = sorted(
+            {
+                str(value)
+                for value in group["tier_family"].dropna().tolist()
+            }
+        )
+        lookup[ndc_key] = {
+            "local_plan_coverage": int(group["plan_key"].dropna().astype(str).nunique()),
+            "available_day_supply_options": day_supply_options,
+            "available_tier_family_options": tier_options,
+            "is_insulin": bool(group["is_insulin"].fillna(False).astype(bool).any()),
+        }
+    return lookup
+
+
+def build_default_input_lookups(
+    conn: duckdb.DuckDBPyConnection,
+) -> tuple[dict[tuple[str, int, str], dict[str, Any]], dict[tuple[int, str], dict[str, Any]]]:
+    defaults_df = _fetch_dataframe(
+        conn,
+        """
+        SELECT *
+        FROM gold.drug_input_defaults
+        ORDER BY is_fallback, observation_count DESC, ndc, days_supply, tier_family
+        """,
+    )
+    specific_lookup: dict[tuple[str, int, str], dict[str, Any]] = {}
+    fallback_lookup: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in defaults_df.to_dict("records"):
+        days_supply = int(row.get("days_supply") or 30)
+        tier_family = str(row.get("tier_family") or "brand")
+        if bool(row.get("is_fallback")):
+            fallback_lookup.setdefault((days_supply, tier_family), row)
+            continue
+        ndc = str(row.get("ndc") or "")
+        if ndc:
+            specific_lookup.setdefault((ndc, days_supply, tier_family), row)
+    return specific_lookup, fallback_lookup
+
+
+def build_tier_lookup(
+    conn: duckdb.DuckDBPyConnection,
+) -> dict[tuple[str, int], str]:
+    tier_df = _fetch_dataframe(
+        conn,
+        """
+        WITH ranked AS (
+            SELECT
+                ndc,
+                days_supply,
+                tier_family,
+                count(*) AS match_count,
+                row_number() OVER (
+                    PARTITION BY ndc, days_supply
+                    ORDER BY count(*) DESC, tier_family
+                ) AS rn
+            FROM gold.plan_drug_cost_basis
+            WHERE ndc IS NOT NULL
+              AND days_supply IS NOT NULL
+              AND tier_family IS NOT NULL
+            GROUP BY 1, 2, 3
+        )
+        SELECT ndc, days_supply, tier_family
+        FROM ranked
+        WHERE rn = 1
+        """,
+    )
+    return {
+        (str(row["ndc"]), int(row["days_supply"])): str(row["tier_family"])
+        for row in tier_df.to_dict("records")
+    }
+
+
 def _candidate_local_metadata(
     conn: duckdb.DuckDBPyConnection,
     ndcs: list[str],
@@ -908,8 +1076,10 @@ def _score_drug_candidate(
     requested_tokens = [token for token in requested_normalized.split() if token]
     drug_name = str(candidate_row["preferred_name"])
     synonym = str(candidate_row.get("synonym") or "")
-    normalized_name = _normalize_drug_search_text(drug_name)
-    normalized_synonym = _normalize_drug_search_text(synonym)
+    normalized_name = str(candidate_row.get("normalized_name") or _normalize_drug_search_text(drug_name))
+    normalized_synonym = str(candidate_row.get("normalized_synonym") or _normalize_drug_search_text(synonym))
+    exact_name = str(candidate_row.get("preferred_name_lower") or drug_name.strip().lower())
+    exact_synonym = str(candidate_row.get("synonym_lower") or synonym.strip().lower())
 
     if requested_ndc:
         if str(candidate_row["ndc"]) != requested_ndc:
@@ -924,11 +1094,11 @@ def _score_drug_candidate(
         match_source = "rxcui"
         match_confidence = "exact"
     elif requested_name:
-        if drug_name.lower() == requested_name:
+        if exact_name == requested_name:
             base_score = 85.0
             match_source = "exact_name"
             match_confidence = "exact"
-        elif synonym.lower() == requested_name:
+        elif exact_synonym == requested_name:
             base_score = 80.0
             match_source = "synonym"
             match_confidence = "exact"
@@ -975,21 +1145,34 @@ def resolve_drug_candidates(
     *,
     day_supply: int,
     limit: int = 10,
+    reference_cache: DrugReferenceCache | None = None,
+    local_metadata_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> list[DrugResolutionCandidate]:
-    reference_df = _canonical_drug_reference_frame(conn)
-    if reference_df.empty:
+    cache = reference_cache or build_drug_reference_cache(conn)
+    if not cache.rows:
         return []
+    if medication.ndc:
+        candidate_rows = cache.by_ndc.get(str(medication.ndc).strip().zfill(11), [])
+    elif medication.rxcui:
+        candidate_rows = cache.by_rxcui.get(str(medication.rxcui or "").strip(), [])
+    else:
+        candidate_rows = cache.rows
     matched_rows: list[dict[str, Any]] = []
-    for row in reference_df.to_dict("records"):
+    for row in candidate_rows:
         if _score_drug_candidate(medication, row, day_supply) is not None:
-            matched_rows.append(row)
+            matched_rows.append(dict(row))
     if not matched_rows:
         return []
-    metadata_lookup = _candidate_local_metadata(
-        conn,
-        [str(row["ndc"]) for row in matched_rows],
-        plan_keys,
-    )
+    metadata_lookup = dict(local_metadata_lookup or {})
+    missing_ndcs = sorted({str(row["ndc"]) for row in matched_rows if str(row["ndc"]) not in metadata_lookup})
+    if missing_ndcs:
+        metadata_lookup.update(
+            _candidate_local_metadata(
+                conn,
+                missing_ndcs,
+                plan_keys,
+            )
+        )
     candidates: list[DrugResolutionCandidate] = []
     for row in matched_rows:
         row["local_plan_coverage"] = metadata_lookup.get(str(row["ndc"]), {}).get("local_plan_coverage", 0)
@@ -1054,7 +1237,18 @@ def _resolve_defaults(
     ndc: str,
     day_supply: int,
     tier_family: str,
+    *,
+    specific_lookup: dict[tuple[str, int, str], dict[str, Any]] | None = None,
+    fallback_lookup: dict[tuple[int, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if specific_lookup is not None:
+        specific = specific_lookup.get((ndc, day_supply, tier_family))
+        if specific is not None:
+            return specific
+    if fallback_lookup is not None:
+        fallback = fallback_lookup.get((day_supply, tier_family))
+        if fallback is not None:
+            return fallback
     specific = _fetch_dataframe(
         conn,
         """
@@ -1096,10 +1290,19 @@ def _resolve_defaults(
 
 
 def _infer_tier_family(
-    conn: duckdb.DuckDBPyConnection, ndc: str, day_supply: int, declared_tier_family: str | None
+    conn: duckdb.DuckDBPyConnection,
+    ndc: str,
+    day_supply: int,
+    declared_tier_family: str | None,
+    *,
+    tier_lookup: dict[tuple[str, int], str] | None = None,
 ) -> str:
     if declared_tier_family:
         return declared_tier_family.lower()
+    if tier_lookup is not None:
+        cached = tier_lookup.get((ndc, day_supply))
+        if cached:
+            return str(cached)
     df = _fetch_dataframe(
         conn,
         """
@@ -2160,6 +2363,9 @@ def _generate_recommendations(
     medications: list[MedicationInput],
     config: PipelineConfig | None = None,
     ranking_mode: str = "rules",
+    allow_approximate_match_ranking: bool = False,
+    conn: duckdb.DuckDBPyConnection | None = None,
+    query_context: RecommendationQueryContext | None = None,
 ) -> list[PlanRecommendation]:
     if not medications:
         raise ValueError("At least one medication is required.")
@@ -2171,15 +2377,17 @@ def _generate_recommendations(
         len(medications),
         active_config.build_profile,
     )
-    conn = _connect(active_config)
+    owns_connection = conn is None
+    conn = conn or _connect(active_config)
     zipcode = _normalize_zipcode(beneficiary.zipcode)
-    candidate_plans = _fetch_dataframe(
-        conn,
-        _candidate_plan_query(conn),
-        [zipcode],
+    candidate_plans = (
+        query_context.candidate_plans.copy()
+        if query_context is not None and query_context.candidate_plans is not None
+        else fetch_candidate_plans(conn, zipcode)
     )
     if candidate_plans.empty:
-        conn.close()
+        if owns_connection:
+            conn.close()
         logger.warning("no candidate plans found for zipcode=%s", zipcode)
         return []
 
@@ -2194,31 +2402,47 @@ def _generate_recommendations(
             medication,
             plan_keys,
             day_supply=day_supply,
+            reference_cache=query_context.reference_cache if query_context is not None else None,
+            local_metadata_lookup=query_context.local_drug_metadata if query_context is not None else None,
         )
         selected_candidate, match_review_required = select_drug_candidate(medication, candidates)
         if not candidates:
-            conn.close()
+            if owns_connection:
+                conn.close()
             requested_value = medication.ndc or medication.rxcui or medication.drug_name or medication_id
             raise ValueError(f"Could not resolve medication input: {requested_value}")
         if selected_candidate is None:
-            conn.close()
-            preview = "; ".join(
-                f"{item.drug_name} (NDC {item.ndc}, {item.local_plan_coverage} local plans)"
-                for item in candidates[:3]
-            )
-            requested_value = medication.drug_name or medication.ndc or medication.rxcui or medication_id
-            raise ValueError(
-                f"Medication '{requested_value}' needs manual review before ranking. "
-                f"Top candidates: {preview}. Provide an exact NDC/RXCUI or choose from the drug catalog."
-            )
+            if allow_approximate_match_ranking:
+                selected_candidate = candidates[0]
+                match_review_required = True
+            else:
+                if owns_connection:
+                    conn.close()
+                preview = "; ".join(
+                    f"{item.drug_name} (NDC {item.ndc}, {item.local_plan_coverage} local plans)"
+                    for item in candidates[:3]
+                )
+                requested_value = medication.drug_name or medication.ndc or medication.rxcui or medication_id
+                raise ValueError(
+                    f"Medication '{requested_value}' needs manual review before ranking. "
+                    f"Top candidates: {preview}. Provide an exact NDC/RXCUI or choose from the drug catalog."
+                )
 
         tier_family = _infer_tier_family(
             conn,
             str(selected_candidate.ndc),
             day_supply,
             medication.tier_family,
+            tier_lookup=query_context.tier_lookup if query_context is not None else None,
         )
-        defaults = _resolve_defaults(conn, str(selected_candidate.ndc), day_supply, tier_family)
+        defaults = _resolve_defaults(
+            conn,
+            str(selected_candidate.ndc),
+            day_supply,
+            tier_family,
+            specific_lookup=query_context.defaults_specific_lookup if query_context is not None else None,
+            fallback_lookup=query_context.defaults_fallback_lookup if query_context is not None else None,
+        )
         requested_value = medication.ndc or medication.rxcui or medication.drug_name or ""
         resolved_match = MedicationMatch(
             medication_id=medication_id,
@@ -2256,23 +2480,33 @@ def _generate_recommendations(
             }
         )
 
-    placeholders = ", ".join("?" for _ in plan_keys)
-    basis_df = _fetch_dataframe(
-        conn,
-        f"""
-        SELECT *
-        FROM gold.plan_drug_cost_basis
-        WHERE plan_key IN ({placeholders})
-          AND ndc IN ({", ".join("?" for _ in resolved_medications)})
-        """,
-        plan_keys + [item["ndc"] for item in resolved_medications],
+    resolved_ndcs = [str(item["ndc"]) for item in resolved_medications]
+    if query_context is not None and query_context.basis_df is not None:
+        basis_df = query_context.basis_df.copy()
+        cached_ndcs = (
+            {str(value) for value in basis_df["ndc"].dropna().astype(str).tolist()}
+            if not basis_df.empty and "ndc" in basis_df.columns
+            else set()
+        )
+        missing_ndcs = [ndc for ndc in resolved_ndcs if ndc not in cached_ndcs]
+        if missing_ndcs:
+            extra_basis = fetch_basis_rows(conn, plan_keys, missing_ndcs)
+            if basis_df.empty:
+                basis_df = extra_basis
+            elif not extra_basis.empty:
+                basis_df = pd.concat([basis_df, extra_basis], ignore_index=True)
+    else:
+        basis_df = fetch_basis_rows(conn, plan_keys, resolved_ndcs)
+    channel_df = (
+        query_context.channel_df.copy()
+        if query_context is not None and query_context.channel_df is not None
+        else fetch_channel_summaries(conn, plan_keys)
     )
-    channel_df = _fetch_dataframe(
-        conn,
-        f"SELECT * FROM gold.plan_channel_summary WHERE plan_key IN ({placeholders})",
-        plan_keys,
+    nearest_distances = (
+        dict(query_context.nearest_distances)
+        if query_context is not None and query_context.nearest_distances is not None
+        else _lookup_nearest_preferred_distance(conn, zipcode, plan_keys)
     )
-    nearest_distances = _lookup_nearest_preferred_distance(conn, zipcode, plan_keys)
 
     basis_lookup: dict[tuple[str, str, int], dict[str, Any]] = {}
     for row in basis_df.to_dict("records"):
@@ -2785,7 +3019,8 @@ def _generate_recommendations(
 
         recommendations = apply_hybrid_reranking(recommendations, beneficiary, config=active_config)
 
-    conn.close()
+    if owns_connection:
+        conn.close()
     return recommendations
 
 
@@ -2794,12 +3029,18 @@ def recommend_plans(
     medications: list[MedicationInput],
     config: PipelineConfig | None = None,
     ranking_mode: str = "rules",
+    allow_approximate_match_ranking: bool = False,
+    conn: duckdb.DuckDBPyConnection | None = None,
+    query_context: RecommendationQueryContext | None = None,
 ) -> list[PlanRecommendation]:
     recommendations = _generate_recommendations(
         beneficiary,
         medications,
         config=config,
         ranking_mode=ranking_mode,
+        allow_approximate_match_ranking=allow_approximate_match_ranking,
+        conn=conn,
+        query_context=query_context,
     )
     return recommendations[: max(1, beneficiary.top_n)]
 
@@ -2810,12 +3051,18 @@ def recommend_plan_bundle(
     config: PipelineConfig | None = None,
     ranking_mode: str = "rules",
     comparison_only_plans: list[PlanRecommendation] | None = None,
+    allow_approximate_match_ranking: bool = False,
+    conn: duckdb.DuckDBPyConnection | None = None,
+    query_context: RecommendationQueryContext | None = None,
 ) -> RecommendationBundle:
     recommendations = _generate_recommendations(
         beneficiary,
         medications,
         config=config,
         ranking_mode=ranking_mode,
+        allow_approximate_match_ranking=allow_approximate_match_ranking,
+        conn=conn,
+        query_context=query_context,
     )
     scenario_profile = recommendations[0].scenario_profile if recommendations else SCENARIO_LOW_UTILIZER
     local_coverable_counts = _local_coverable_counts(recommendations)

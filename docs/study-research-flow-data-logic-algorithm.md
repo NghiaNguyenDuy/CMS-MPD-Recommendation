@@ -73,9 +73,10 @@ research-mode summaries"]
 3. `extract.py` locates CMS SPUF archives, reference CSVs, and RXCUI shards, then extracts archive members into `data/staging/<snapshot>/raw`.
 4. `pipeline.py` builds `bronze.*`, `silver.*`, `gold.*`, and ensures `synthetic.*` exists.
 5. `recommend.py` reads the gold serving layer, resolves medication identity, simulates annual fill-level cost plan by plan, and returns ranked recommendations with explanation groups and detailed fill traces.
-6. `scripts/generate_beneficiary_profiles.py` optionally creates `synthetic.syn_beneficiary` and `synthetic.syn_beneficiary_prescriptions` from either simulated profiles or PDE-derived regimens.
-7. `modeling.py` replays recommendation scenarios into a feature dataset, creates weak-label ranking targets, trains rerankers, and evaluates rules-only versus reranked orderings on held-out scenarios.
-8. `research_eval.py` converts the evaluation report into frames used by research mode.
+6. `scenario_generation.py` materializes canonical mixed-source scenarios in `synthetic.training_scenarios`, `synthetic.training_scenario_medications`, and `synthetic.training_scenario_manifest`.
+7. `scripts/generate_beneficiary_profiles.py` remains available for legacy `synthetic.syn_*` support tables.
+8. `modeling.py` replays canonical recommendation scenarios into a feature dataset, creates weak-label ranking targets, trains rerankers, and evaluates rules-only versus reranked orderings on scenario-, ZIP-, and regimen-held-out splits.
+9. `research_eval.py` converts the evaluation report into frames used by research mode.
 
 ## 4. Data Logic
 
@@ -193,7 +194,15 @@ The study is strongest when these categories are kept distinct. The code mostly 
 
 ### 4.5 Important repository-state note
 
-The current modeling code declares dataset schema `request_features_v4`, but the checked-in dataset CSV and metadata under `data/training/2025-Q3/full/` still expose `request_features_v2` and `research_v2`, while the evaluation JSON already reflects `request_features_v4`. That means the research workflow is conceptually clear, but stored artifacts are partially out of sync and should be rebuilt if strict reproducibility is required.
+The current local artifact state is aligned to the rebuilt database and the newer scenario-aware generation path:
+
+- dataset schema: `request_features_v4`
+- feature version: `research_v4`
+- canonical training scenarios: `synthetic.training_*`
+- default generation strategy: mixed-source
+- default training policy: `student_safe`
+
+The research workflow therefore no longer depends on an implicit synthetic-or-benchmark fallback. It materializes canonical scenarios first, then builds the reranker dataset from that scenario layer.
 
 ## 5. Recommendation Algorithm
 
@@ -540,14 +549,20 @@ These templates are repeated across a set of ZIP codes taken from `gold.plan_ser
 
 ### Synthetic / PDE scenarios
 
-When synthetic tables exist, `modeling.py` prefers them.
+The current dataset builder uses canonical mixed-source scenario tables first:
 
-Those scenarios are built from:
+- `synthetic.training_scenarios`
+- `synthetic.training_scenario_medications`
+- `synthetic.training_scenario_manifest`
+
+Those tables combine PDE-grounded, benchmark, and stress scenarios under the current scenario-profile taxonomy.
+
+The older raw-support tables remain available:
 
 - `synthetic.syn_beneficiary`
 - `synthetic.syn_beneficiary_prescriptions`
 
-and converted into runtime `BeneficiaryInput` plus `MedicationInput` objects.
+but they are no longer the effective training contract.
 
 ### 6.2 How synthetic beneficiaries are built
 
@@ -724,21 +739,28 @@ Acceptance checks are intentionally simple:
 
 The checked-in evaluation JSON under `data/training/2025-Q3/full/hybrid_reranker_evaluation_tree.json` reports:
 
-- `1774` dataset rows
-- `32` scenarios
-- `22` training scenarios and `10` test scenarios
-- held-out evaluation with seed `42` and test fraction `0.3`
+- `33961` dataset rows
+- `600` canonical mixed-source scenarios
+- `24016` training rows and `9945` test rows
+- held-out-by-scenario evaluation with seed `42` and test fraction `0.3`
+- chunked replay metadata with `88` completed ZIP-grouped chunks at chunk size `10`
 
 Reported system means:
 
 | System | Top-1 | Top-5 overlap | Top-10 overlap | NDCG@5 | Top-5 avg uncovered |
 |---|---|---|---|---|---|
-| rules_only | 0.60 | 0.98 | 0.88 | 0.893 | 0.10 |
-| heuristic_baseline | 0.70 | 1.00 | 0.91 | 0.912 | 0.10 |
-| linear_reranker | 0.80 | 0.88 | 0.88 | 0.924 | 0.10 |
-| tree_reranker | 1.00 | 1.00 | 0.97 | 1.000 | 0.10 |
+| rules_only | 0.622 | 0.698 | 0.786 | 0.830 | 0.414 |
+| heuristic_baseline | 0.811 | 0.899 | 0.953 | 0.924 | 0.463 |
+| linear_reranker | 0.628 | 0.879 | 0.919 | 0.899 | 0.459 |
+| tree_reranker | 0.861 | 0.934 | 0.962 | 0.953 | 0.459 |
 
-These numbers indicate strong internal fit to the weak-label objective. They do not prove real-world beneficiary outcome superiority.
+Acceptance status on the refreshed harder dataset is mixed:
+
+- `top5_improved = true`
+- `top10_improved = true`
+- `uncovered_not_worse = false`
+
+This means the rebuilt tree reranker improves alignment with the weak-label ordering, but its top-5 uncovered-drug burden is now slightly worse than the rules-only baseline on the mixed-source scenario set. The replay pipeline is therefore synchronized and much faster, but the model itself still needs another tuning pass if the original safety acceptance gate is to remain satisfied.
 
 ## 7. Why The Study Logic Looks This Way
 
