@@ -6,10 +6,12 @@ import logging
 from dataclasses import asdict
 from pathlib import Path
 
-from .config import PipelineConfig
+from .config import BENEFIT_DESIGN_MODES, PipelineConfig
+from .decision_support import recommendation_bundle_to_public_payload
 from .modeling import build_training_dataset, evaluate_hybrid_reranker, train_hybrid_reranker
 from .pipeline import health_check, run_pipeline
-from .recommend import BeneficiaryInput, MedicationInput, recommend_plans
+from .recommend import BeneficiaryInput, MedicationInput, recommend_plan_bundle, recommend_plans
+from .scenario_generation import generate_training_scenarios
 
 
 def _add_config_arguments(
@@ -18,6 +20,7 @@ def _add_config_arguments(
     include_demo_zipcode: bool = False,
 ) -> None:
     parser.add_argument("--build-profile", default="full", choices=["full", "demo"])
+    parser.add_argument("--benefit-design-mode", default="auto", choices=list(BENEFIT_DESIGN_MODES))
     parser.add_argument("--snapshot-quarter", default="2025-Q3")
     parser.add_argument(
         "--data-dir",
@@ -57,6 +60,48 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Optional scenario bundle filter for research dataset generation",
     )
+    dataset.add_argument(
+        "--scenario-source-strategy",
+        default="mixed",
+        choices=["mixed", "pde", "benchmark"],
+    )
+    dataset.add_argument("--target-scenario-count", type=int, default=0)
+    dataset.add_argument("--generator-seed", type=int, default=42)
+    dataset.add_argument("--refresh-scenarios", action="store_true")
+    dataset.add_argument(
+        "--max-workers",
+        type=int,
+        default=0,
+        help="Optional worker count for CPU-parallel scenario replay during dataset generation",
+    )
+    dataset.add_argument(
+        "--chunk-size",
+        type=int,
+        default=10,
+        help="Number of scenarios per persisted chunk during dataset generation",
+    )
+    dataset.add_argument(
+        "--stale-chunk-hours",
+        type=int,
+        default=6,
+        help="Age threshold used to clean up old started chunk state before resume",
+    )
+    dataset.add_argument(
+        "--no-resume-chunks",
+        action="store_true",
+        help="Rebuild dataset chunks from scratch instead of resuming completed chunk files",
+    )
+
+    generate = subparsers.add_parser("generate-scenarios", help="Materialize canonical training scenarios")
+    _add_config_arguments(generate)
+    generate.add_argument(
+        "--scenario-source-strategy",
+        default="mixed",
+        choices=["mixed", "pde", "benchmark"],
+    )
+    generate.add_argument("--target-scenario-count", type=int, default=0)
+    generate.add_argument("--generator-seed", type=int, default=42)
+    generate.add_argument("--refresh-scenarios", action="store_true")
 
     train = subparsers.add_parser("train-model", help="Train the hybrid reranker artifact")
     _add_config_arguments(train)
@@ -65,6 +110,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--feature-subset",
         default="full",
         choices=["cost_only", "cost_plus_restrictions", "cost_plus_restrictions_network", "full"],
+    )
+    train.add_argument(
+        "--teacher-feature-policy",
+        default="student_safe",
+        choices=["student_safe", "teacher_features"],
     )
 
     evaluate = subparsers.add_parser("evaluate-model", help="Evaluate the hybrid reranker artifact")
@@ -80,6 +130,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Evaluate only rules, heuristic, and linear baselines",
     )
+    evaluate.add_argument(
+        "--teacher-feature-policy",
+        default="student_safe",
+        choices=["student_safe", "teacher_features"],
+    )
 
     recommend = subparsers.add_parser("recommend", help="Score plans for a beneficiary")
     _add_config_arguments(recommend)
@@ -89,6 +144,11 @@ def _build_parser() -> argparse.ArgumentParser:
     recommend.add_argument("--pharmacy-preference", default="auto", choices=["auto", "retail", "mail"])
     recommend.add_argument("--top-n", type=int, default=5)
     recommend.add_argument("--ranking-mode", default="rules", choices=["rules", "hybrid"])
+    recommend.add_argument(
+        "--shortlist-mode",
+        default="default",
+        choices=["default", "full_coverage_compare"],
+    )
     recommend.add_argument(
         "--user-role",
         default="beneficiary",
@@ -130,6 +190,7 @@ def _build_config(args: argparse.Namespace) -> PipelineConfig:
     demo_zipcodes = tuple(getattr(args, "demo_zipcode", []) or default_config.demo_zipcodes)
     return PipelineConfig(
         build_profile=build_profile,
+        benefit_design_mode=getattr(args, "benefit_design_mode", default_config.benefit_design_mode),
         demo_zipcodes=demo_zipcodes,
         snapshot_quarter=getattr(args, "snapshot_quarter", default_config.snapshot_quarter),
         data_dir=Path(args.data_dir) if getattr(args, "data_dir", None) else None,
@@ -152,8 +213,36 @@ def main() -> None:
         print(json.dumps(health_check(config=config), indent=2))
         return
 
+    if args.command == "generate-scenarios":
+        print(
+            json.dumps(
+                generate_training_scenarios(
+                    config=config,
+                    scenario_source_strategy=args.scenario_source_strategy,
+                    target_scenario_count=(args.target_scenario_count or None),
+                    generator_seed=args.generator_seed,
+                    refresh=args.refresh_scenarios,
+                ),
+                indent=2,
+            )
+        )
+        return
+
     if args.command == "build-dataset":
-        print(build_training_dataset(config=config, scenario_bundles=args.scenario_bundle or None))
+        print(
+            build_training_dataset(
+                config=config,
+                scenario_bundles=args.scenario_bundle or None,
+                scenario_source_strategy=args.scenario_source_strategy,
+                target_scenario_count=(args.target_scenario_count or None),
+                generator_seed=args.generator_seed,
+                refresh_scenarios=args.refresh_scenarios,
+                max_workers=(args.max_workers or None),
+                chunk_size=args.chunk_size,
+                resume_chunks=not args.no_resume_chunks,
+                stale_chunk_hours=args.stale_chunk_hours,
+            )
+        )
         return
 
     if args.command == "train-model":
@@ -162,6 +251,7 @@ def main() -> None:
                 config=config,
                 model_type=args.model_type,
                 feature_subset=args.feature_subset,
+                teacher_feature_policy=args.teacher_feature_policy,
             )
         )
         return
@@ -173,6 +263,7 @@ def main() -> None:
                     config=config,
                     scenario_bundles=args.scenario_bundle or None,
                     baseline_only=args.baseline_only,
+                    teacher_feature_policy=args.teacher_feature_policy,
                 ),
                 indent=2,
             )
@@ -194,6 +285,24 @@ def main() -> None:
         user_role=args.user_role,
         decision_focus=args.decision_focus,
     )
+    if args.shortlist_mode == "full_coverage_compare":
+        bundle = recommend_plan_bundle(
+            beneficiary,
+            medications,
+            config=config,
+            ranking_mode=args.ranking_mode,
+        )
+        print(
+            json.dumps(
+                recommendation_bundle_to_public_payload(
+                    bundle,
+                    minimum_coverage_pct=100.0,
+                ),
+                indent=2,
+            )
+        )
+        return
+
     recommendations = recommend_plans(
         beneficiary,
         medications,

@@ -1,7 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pandas as pd
@@ -9,13 +11,15 @@ import pandas as pd
 from cms_mpd.config import PipelineConfig
 from cms_mpd.extract import SourcePaths
 from cms_mpd.modeling import (
+    DATASET_CHUNK_MANIFEST_VERSION,
+    ReplayWorkerContext,
     build_training_dataset,
     evaluate_hybrid_reranker,
     load_hybrid_reranker,
     train_hybrid_reranker,
 )
 from cms_mpd.pipeline import build_database, health_check
-from cms_mpd.recommend import BeneficiaryInput, MedicationInput, recommend_plans
+from cms_mpd.recommend import BeneficiaryInput, MedicationInput, recommend_plan_bundle, recommend_plans
 
 
 def _write(path: Path, content: str) -> Path:
@@ -180,6 +184,8 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
 
     conn = duckdb.connect(str(db_path), read_only=True)
     assert conn.execute("SELECT count(*) FROM gold.plan_summary").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM gold.plan_summary WHERE contract_year = 2025").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM gold.ui_plan_drug_serving WHERE contract_year = 2025").fetchone()[0] == 4
     formulary_summary = conn.execute(
         """
         SELECT
@@ -222,16 +228,48 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert recommendations[0].fit_score >= recommendations[1].fit_score
     assert recommendations[0].fit_label
     assert recommendations[0].fit_summary
+    assert recommendations[0].scenario_profile
+    assert recommendations[0].match_review_required is False
     assert recommendations[0].monthly_cost_estimate == round(recommendations[0].annual_total_cost / 12, 2)
-    assert recommendations[0].feature_version
+    assert recommendations[0].feature_version == "research_v4"
+    assert recommendations[0].contract_year == 2025
+    assert recommendations[0].benefit_design == "2025_redesign"
+    assert recommendations[0].priced_drug_count == 2
+    assert recommendations[0].channel_switch_count == 0
+    assert recommendations[0].simulation_policy == "cost_realism_v1"
+    assert recommendations[1].priced_drug_count == 1
     assert recommendations[0].resolved_medications[0].match_source == "exact_name"
     assert recommendations[0].drug_breakdowns[0].coverage_status == "covered"
     assert recommendations[0].drug_breakdowns[0].medication_id
     assert recommendations[0].drug_breakdowns[0].pricing_status == "priced"
     assert recommendations[0].drug_breakdowns[0].fill_traces
     assert recommendations[0].drug_breakdowns[0].fill_traces[0].coverage_phase
+    assert recommendations[0].drug_breakdowns[0].fill_traces[0].sequence_index >= 1
+    assert recommendations[0].drug_breakdowns[1].fill_traces[0].sequence_index < recommendations[0].drug_breakdowns[0].fill_traces[0].sequence_index
+    assert recommendations[0].drug_breakdowns[0].fill_traces[0].benefit_design == "2025_redesign"
+    assert recommendations[0].drug_breakdowns[0].coverage_gap_flag is False
     assert recommendations[1].drug_breakdowns[1].coverage_status == "excluded"
     assert recommendations[1].explanation_groups.coverage_issues
+    assert "uncovered_exact_drug" in recommendations[1].unsafe_reasons
+
+    bundle = recommend_plan_bundle(beneficiary, medications, config=config)
+    assert bundle.summary.requested_drug_count == 2
+    assert bundle.summary.local_candidate_plan_count == 2
+    assert bundle.summary.local_full_coverage_count == 1
+    assert bundle.summary.local_partial_count == 1
+    assert bundle.summary.fallback_reason == "none"
+    assert bundle.summary.scenario_profile == recommendations[0].scenario_profile
+    assert bundle.summary.candidate_plan_count_service_area == 2
+    assert bundle.summary.candidate_plan_count_ranked == 2
+    assert bundle.summary.plans_with_unknown_network_count == 0
+    assert [item.plan_name for item in bundle.full_coverage_plans] == ["Plan A"]
+    assert bundle.partial_fallback_plans == []
+    assert bundle.blocked_medications == []
+
+    reversed_recommendations = recommend_plans(beneficiary, list(reversed(medications)), config=config)
+    assert [item.plan_key for item in reversed_recommendations] == [item.plan_key for item in recommendations]
+    assert [item.annual_total_cost for item in reversed_recommendations] == [item.annual_total_cost for item in recommendations]
+    assert [item.priced_drug_count for item in reversed_recommendations] == [item.priced_drug_count for item in recommendations]
 
     duplicate_medications = [
         MedicationInput(drug_name="insulin glargine", tier_family="brand", day_supply=30),
@@ -255,6 +293,30 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     hybrid_fallback = recommend_plans(beneficiary, medications, config=config, ranking_mode="hybrid")
     assert all(item.ranking_source == "rules_only" for item in hybrid_fallback)
     assert all(item.model_score is None for item in hybrid_fallback)
+
+    replay_worker = ReplayWorkerContext(config)
+    replay_scenario = SimpleNamespace(
+        beneficiary=beneficiary,
+        medications=medications,
+        scenario_id="scenario_cached",
+        scenario_bundle="maintenance_generic",
+        regimen_signature="fixture",
+        scenario_source_kind="benchmark",
+        scenario_source_label="fixture",
+        intended_profile="maintenance_generic",
+    )
+    replay_worker.warm_chunk([replay_scenario])
+    cached_recommendations = recommend_plans(
+        beneficiary,
+        medications,
+        config=config,
+        conn=replay_worker.conn,
+        query_context=replay_worker.query_context_for_scenario(replay_scenario),
+    )
+    replay_worker.close()
+    assert [item.plan_key for item in cached_recommendations] == [item.plan_key for item in recommendations]
+    assert [item.coverage_status for item in cached_recommendations] == [item.coverage_status for item in recommendations]
+    assert [item.annual_total_cost for item in cached_recommendations] == [item.annual_total_cost for item in recommendations]
 
     generator = _load_generator_module()
     write_conn = duckdb.connect(str(db_path))
@@ -282,13 +344,60 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     )
     write_conn.close()
 
-    dataset_path = build_training_dataset(config=config)
+    dataset_path = build_training_dataset(
+        config=config,
+        target_scenario_count=30,
+        refresh_scenarios=True,
+    )
     assert dataset_path.exists()
     assert config.training_dataset_metadata_path.exists()
     dataset_frame = pd.read_csv(dataset_path)
     assert {"scenario_id", "plan_key", "weak_label_score", "heuristic_score"}.issubset(dataset_frame.columns)
-    assert {"feature_version", "negotiated_price_total", "lis_adjusted_oop_total"}.issubset(dataset_frame.columns)
+    assert {
+        "feature_version",
+        "negotiated_price_total",
+        "lis_adjusted_oop_total",
+        "contract_year",
+        "benefit_design",
+        "priced_drug_share",
+        "monthly_drug_oop_variance",
+        "monthly_total_variance",
+        "scenario_profile",
+        "match_review_required_flag",
+        "unknown_network_data_flag",
+        "beneficiary_zipcode",
+        "regimen_signature",
+        "scenario_source_kind",
+    }.issubset(dataset_frame.columns)
     assert len(dataset_frame) > 0
+    with config.training_dataset_metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    chunk_dir = Path(metadata["chunk_dir"])
+    manifest_path = chunk_dir / "build_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert metadata["manifest_version"] == DATASET_CHUNK_MANIFEST_VERSION
+    assert metadata["zip_grouped_chunks"] is True
+    assert metadata["chunk_size"] == 10
+    assert manifest["manifest_version"] == DATASET_CHUNK_MANIFEST_VERSION
+    assert manifest["chunk_count"] == metadata["chunk_count"]
+    assert manifest["stale_chunk_hours"] == 6
+    assert manifest["chunks"]
+    assert all(chunk["status"] == "completed" for chunk in manifest["chunks"])
+    assert all(chunk["zipcodes"] for chunk in manifest["chunks"])
+    with duckdb.connect(str(db_path), read_only=True) as read_conn:
+        assert read_conn.execute("SELECT count(*) FROM synthetic.training_scenarios").fetchone()[0] == 30
+        assert read_conn.execute("SELECT count(*) FROM synthetic.training_scenario_medications").fetchone()[0] > 0
+        assert read_conn.execute("SELECT count(*) FROM synthetic.training_scenario_manifest").fetchone()[0] == 6
+
+    resumed_dataset_path = build_training_dataset(
+        config=config,
+        target_scenario_count=30,
+    )
+    assert resumed_dataset_path == dataset_path
+    with config.training_dataset_metadata_path.open("r", encoding="utf-8") as handle:
+        resumed_metadata = json.load(handle)
+    assert resumed_metadata["resumed_chunk_count"] == resumed_metadata["chunk_count"]
+    assert resumed_metadata["completed_chunk_count"] == resumed_metadata["chunk_count"]
 
     linear_artifact_path = train_hybrid_reranker(
         config=config,
@@ -309,6 +418,16 @@ def test_pipeline_build_and_recommendation_smoke(tmp_path):
     assert "tree_reranker" in evaluation["systems"]
     assert "scenario_bundle_metrics" in evaluation
     assert "acceptance" in evaluation
+    assert evaluation["evaluation_mode"] == "held_out_by_scenario"
+    assert set(evaluation["evaluation_modes"]) == {
+        "held_out_by_scenario",
+        "held_out_by_zip",
+        "held_out_by_regimen_signature",
+    }
+    assert evaluation["train_rows"] + evaluation["test_rows"] == len(dataset_frame)
+    assert evaluation["train_scenario_count"] > 0
+    assert evaluation["test_scenario_count"] > 0
+    assert set(evaluation["train_scenarios"]).isdisjoint(evaluation["test_scenarios"])
 
     hybrid_recommendations = recommend_plans(beneficiary, medications, config=config, ranking_mode="hybrid")
     assert len(hybrid_recommendations) == 2

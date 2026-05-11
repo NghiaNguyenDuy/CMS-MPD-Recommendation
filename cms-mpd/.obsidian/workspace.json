@@ -1,0 +1,225 @@
+{
+  "main": {
+    "id": "907040373c9db3bd",
+    "type": "split",
+    "children": [
+      {
+        "id": "0a152d17d62e20a8",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "18a00c44c5f9f22e",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "01 Inbox/References/URLs package.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "URLs package"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "2eb5730dc910ae7f",
+    "type": "split",
+    "children": [
+      {
+        "id": "a07f50cda791dd3d",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "e73cec5f2f0c4e00",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "8e6e42d3a034eddc",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "d175a41cea5c37fe",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 501.5
+  },
+  "right": {
+    "id": "5dc2e687f45aeae6",
+    "type": "split",
+    "children": [
+      {
+        "id": "c65cd130a267b749",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "25dc8e722bd38f83",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft"
+            }
+          },
+          {
+            "id": "091a55f23261e167",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Welcome.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from Welcome"
+            }
+          },
+          {
+            "id": "6ad7586120225a33",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "8da4b6d0d4466f86",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "873c8eb852d80010",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Welcome.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of Welcome"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "18a00c44c5f9f22e",
+  "lastOpenFiles": [
+    "01 Inbox/Articles/Using an Online Decision Aid to Help Medicare Beneficiaries Choose a Prescription Drug Plan.md",
+    "01 Inbox/Articles/Medicare Part D Plans Rarely Cover Brand-Name Drugs When.md",
+    "01 Inbox/Web Imports/Key Facts About Medicare Drug Price Negotiation.md",
+    "01 Inbox/Web Imports/Insulin Out-of-Pocket Costs in Medicare Part D.md",
+    "01 Inbox/Web Imports/2027 Part D Application Final.md",
+    "01 Inbox/Web Imports/2027 Medicare Advantage and Part D Advance Notice.md",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft.md",
+    "05 Outputs/Manuscripts/~$S MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - native IEEE citations.docx",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - native IEEE citations.tmp.docx",
+    "05 Outputs/Manuscripts/~WRL0716.tmp",
+    "05 Outputs/Manuscripts/~WRD0498.tmp",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - native IEEE citations.docx",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Peer Review Integrated Draft 2026-05-01.md",
+    "99 Archive/CMS MPD Manuscript - CMPB Update - 2026-05-01.md",
+    "05 Outputs/Manuscripts/~$S MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Peer Review Integrated Draft 2026-05-01.docx",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Peer Review Integrated Draft 2026-05-01.docx",
+    "99 Archive/CMS MPD Figure 3 - Overall Research Flow.drawio",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - Shortened 2026-05-01.docx",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - Shortened 2026-05-01.md",
+    "05 Outputs/Manuscripts/chatgpt-peer-review.md",
+    "05 Outputs/Manuscripts/deep-research-report.md.crdownload",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - Shortened 2026-05-01.md",
+    "05 Outputs/Summaries/CMS MPD Specific Prescription Case Illustrations.md",
+    "05 Outputs/Summaries/CMS MPD Source Processing Summary - 2026-04-07.md",
+    "05 Outputs/Summaries/CMS MPD Simulated Cost Calculation and Recommendation Flow - Sample.md",
+    "05 Outputs/Manuscripts/CMS MPD Journal Alignment and Submission Checklist.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Revision.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft 1 1.md",
+    "05 Outputs/Summaries/CMS MPD Ranking Models, Evaluation Metrics, and Cost Simulation - Technical Explanation.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft 2026-04-25.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft 24-04-2026 1.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft 24-4-2026.md",
+    "02 Source Notes/Source - Reviewer Literature Expansion and Scientific Reliability.md",
+    "03 Topic Notes/Topic - Manuscript Scientific Reliability Evidence Map.md"
+  ]
+}

@@ -101,9 +101,10 @@ Its value is in connecting three layers that are often separate:
 The current version is focused on:
 
 - local CMS Q3 2025 source snapshots
+- 2025 redesigned Part D benefit logic by default, with explicit `2024_standard` support for historical comparisons
 - ZIP-centroid-based pharmacy distance estimation
 - rules-first recommendation with optional hybrid reranking
 - top plan comparison for beneficiaries and counselor workflows
-- research evaluation using synthetic and PDE-derived scenarios
+- research evaluation using synthetic and PDE-derived scenarios with held-out scenario testing
 
 It is best understood as a strong technical and product foundation for a more advanced Medicare Part D recommendation platform.

@@ -1,0 +1,80 @@
+formulas:
+  days_since_edit: (now() - file.mtime).days.round(0)
+properties:
+  file.name:
+    displayName: Note
+  type:
+    displayName: Type
+  status:
+    displayName: Status
+  source_title:
+    displayName: Source Title
+  topic_area:
+    displayName: Topic Area
+  imported_on:
+    displayName: Imported
+  reviewed_on:
+    displayName: Reviewed
+  related_topics:
+    displayName: Related Topics
+  related_sources:
+    displayName: Related Sources
+  formula.days_since_edit:
+    displayName: Days Since Edit
+  file.mtime:
+    displayName: Modified
+  file.size:
+    displayName: Size
+views:
+  - type: table
+    name: Source Notes
+    filters:
+      and:
+        - type == "source-note"
+    groupBy:
+      property: status
+      direction: ASC
+    order:
+      - file.name
+      - status
+      - source_title
+      - imported_on
+      - related_topics
+      - formula.days_since_edit
+  - type: table
+    name: Topic Notes
+    filters:
+      and:
+        - type == "topic-note"
+    groupBy:
+      property: topic_area
+      direction: ASC
+    order:
+      - file.name
+      - status
+      - topic_area
+      - reviewed_on
+      - related_sources
+      - formula.days_since_edit
+  - type: table
+    name: Study Notes
+    filters:
+      and:
+        - type == "study-note"
+    groupBy:
+      property: status
+      direction: ASC
+    order:
+      - file.name
+      - status
+      - file.mtime
+      - formula.days_since_edit
+  - type: table
+    name: PDF Library
+    filters:
+      and:
+        - file.inFolder("materials/PDFs")
+    order:
+      - file.name
+      - file.mtime
+      - file.size

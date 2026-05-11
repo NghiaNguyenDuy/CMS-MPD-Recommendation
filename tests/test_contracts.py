@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from cms_mpd.app_support import (
     append_medication_row,
-    build_medication_row_from_catalog,
     build_counselor_note,
+    build_medication_row_from_catalog,
+    build_monthly_timeline_frame,
     build_side_by_side_frame,
+    build_what_if_scenarios,
+    build_what_if_summary_frame,
+    catalog_available_day_supply_options,
+    catalog_tier_family_options,
     format_drug_catalog_option,
     parse_medication_frame,
     search_drug_catalog,
+    summarize_drug_channel_path,
     summarize_evidence_gaps,
+    summarize_what_if_findings,
 )
 from cms_mpd.config import PipelineConfig
 from cms_mpd.decision_support import (
@@ -19,10 +27,14 @@ from cms_mpd.decision_support import (
     ProfileInput,
     as_public_types,
     create_run_audit,
+    recommendation_bundle_to_dataframes,
+    recommendation_bundle_to_public_payload,
     recommendations_to_dataframe,
     summarize_feature_coverage,
 )
 from cms_mpd.recommend import (
+    AlternativeSearchTerm,
+    BlockedMedication,
     DrugFillTrace,
     ExplanationItem,
     MedicationMatch,
@@ -31,6 +43,8 @@ from cms_mpd.recommend import (
     PlanExplanationGroups,
     PlanFitMetrics,
     PlanRecommendation,
+    RecommendationBundle,
+    RecommendationBundleSummary,
 )
 
 
@@ -52,6 +66,7 @@ def _sample_recommendation(
     fill_trace = DrugFillTrace(
         fill_number=1,
         day_offset=0,
+        sequence_index=1,
         selected_channel="pref_retail",
         coverage_phase="initial_coverage",
         pricing_status="priced",
@@ -165,6 +180,8 @@ def _sample_recommendation(
         annual_oop=annual_drug_oop,
         deductible_exposure=0.0,
         initial_coverage_oop=annual_drug_oop,
+        coverage_gap_oop=0.0,
+        catastrophic_oop=0.0,
         lis_adjusted_oop=annual_drug_oop,
         negotiated_price_total=120.0,
         oop_cap_savings=0.0,
@@ -172,14 +189,14 @@ def _sample_recommendation(
         st_flag=False,
         ql_flag=False,
         insulin_flag=True,
-        coverage_gap_flag=uncovered_drug_count > 0,
+        coverage_gap_flag=False,
         coverage_status="covered" if uncovered_drug_count == 0 else "excluded",
-        pricing_status="priced",
-        coverage_phases=["initial_coverage"],
+        pricing_status="priced" if uncovered_drug_count == 0 else "excluded",
+        coverage_phases=["initial_coverage"] if uncovered_drug_count == 0 else [],
         match_source="exact_name",
         match_confidence="exact",
-        explanations=["Insulin glargine priced successfully."],
-        fill_traces=[fill_trace],
+        explanations=["Insulin glargine priced successfully."] if uncovered_drug_count == 0 else ["Insulin glargine is excluded from coverage."],
+        fill_traces=[fill_trace] if uncovered_drug_count == 0 else [],
     )
     return PlanRecommendation(
         plan_key=plan_key,
@@ -229,8 +246,16 @@ def _sample_recommendation(
         nearest_preferred_distance_miles=nearest_distance_miles,
         service_area_eligible=not comparison_only,
         comparison_only=comparison_only,
-        feature_version="research_v2",
+        scenario_profile="insulin_chronic" if restriction_count else "low_utilizer",
+        match_review_required=False,
+        unsafe_reasons=["uncovered_exact_drug"] if uncovered_drug_count else [],
+        feature_version="research_v4",
         drug_breakdowns=[drug_breakdown],
+        contract_year=2025,
+        benefit_design="2025_redesign",
+        priced_drug_count=1 if uncovered_drug_count == 0 else 0,
+        channel_switch_count=0,
+        simulation_policy="cost_realism_v1",
     )
 
 
@@ -286,6 +311,84 @@ def test_parse_medication_frame_validates_rows():
     assert any("day_supply must be 30, 60, or 90" in message for message in errors)
 
 
+def test_monthly_timeline_and_channel_path_helpers():
+    recommendation = _sample_recommendation(
+        plan_key="P4",
+        plan_name="Delta Guided",
+        annual_total_cost=1320.0,
+        annual_premium=360.0,
+        annual_drug_oop=960.0,
+    )
+    recommendation.channel_switch_count = 1
+    recommendation.drug_breakdowns[0].fill_traces = [
+        DrugFillTrace(
+            fill_number=1,
+            day_offset=0,
+            sequence_index=1,
+            selected_channel="pref_retail",
+            coverage_phase="initial_coverage",
+            pricing_status="priced",
+            negotiated_price=25.0,
+            deductible_before=100.0,
+            deductible_applied=10.0,
+            deductible_after=90.0,
+            base_oop=10.0,
+            initial_coverage_oop=10.0,
+            lis_adjusted_oop=10.0,
+            final_oop=10.0,
+            oop_before=0.0,
+            oop_after=10.0,
+            oop_cap_applied=False,
+        ),
+        DrugFillTrace(
+            fill_number=2,
+            day_offset=45,
+            sequence_index=2,
+            selected_channel="pref_mail",
+            coverage_phase="initial_coverage",
+            pricing_status="priced",
+            negotiated_price=20.0,
+            deductible_before=90.0,
+            deductible_applied=0.0,
+            deductible_after=90.0,
+            base_oop=8.0,
+            initial_coverage_oop=8.0,
+            lis_adjusted_oop=8.0,
+            final_oop=8.0,
+            oop_before=10.0,
+            oop_after=18.0,
+            oop_cap_applied=False,
+        ),
+    ]
+
+    timeline = build_monthly_timeline_frame(recommendation)
+    channel_path = summarize_drug_channel_path(recommendation.drug_breakdowns[0])
+
+    assert list(timeline.columns) == [
+        "Month",
+        "Month number",
+        "Drug OOP",
+        "Deductible applied",
+        "Monthly premium",
+        "Projected monthly total",
+        "Cumulative drug OOP",
+        "Cumulative total",
+        "Fill count",
+        "Filled drugs",
+    ]
+    assert timeline.iloc[0]["Month"] == "Jan"
+    assert timeline.iloc[1]["Month"] == "Feb"
+    assert timeline.iloc[0]["Month number"] == 1
+    assert timeline.iloc[1]["Month number"] == 2
+    assert timeline.iloc[0]["Drug OOP"] == 10.0
+    assert timeline.iloc[1]["Drug OOP"] == 8.0
+    assert timeline.iloc[0]["Deductible applied"] == 10.0
+    assert timeline.iloc[1]["Cumulative drug OOP"] == 18.0
+    assert timeline.iloc[0]["Projected monthly total"] == 40.0
+    assert "Switches 1 time(s)" in channel_path
+    assert "preferred retail -> preferred mail" in channel_path
+
+
 def test_drug_catalog_search_and_add_row_helpers():
     catalog = pd.DataFrame(
         [
@@ -296,6 +399,8 @@ def test_drug_catalog_search_and_add_row_helpers():
                 "ndc": "00000000002",
                 "tier_family": "brand",
                 "default_day_supply": 30,
+                "available_day_supply_options": [30, 90],
+                "available_tier_family_options": ["brand", "specialty"],
                 "plan_coverage": 120,
                 "is_insulin": True,
             },
@@ -306,6 +411,8 @@ def test_drug_catalog_search_and_add_row_helpers():
                 "ndc": "00000000001",
                 "tier_family": "generic",
                 "default_day_supply": 90,
+                "available_day_supply_options": [30, 60, 90],
+                "available_tier_family_options": ["generic"],
                 "plan_coverage": 98,
                 "is_insulin": False,
             },
@@ -317,16 +424,105 @@ def test_drug_catalog_search_and_add_row_helpers():
 
     option_label = format_drug_catalog_option(matches.iloc[0])
     assert "insulin glargine" in option_label
-    assert "30-day default" in option_label
+    assert "days 30/90" in option_label
+    assert "tiers brand, specialty" in option_label
+    assert catalog_available_day_supply_options(matches.iloc[0]) == [30, 90]
+    assert catalog_tier_family_options(matches.iloc[0]) == ["brand", "specialty"]
 
-    new_row = build_medication_row_from_catalog(matches.iloc[0], day_supply=60, tier_family="brand")
+    array_row = matches.iloc[0].to_dict()
+    array_row["available_tier_family_options"] = np.array(["brand", "specialty"], dtype=object)
+    assert catalog_tier_family_options(array_row) == ["brand", "specialty"]
+
+    new_row = build_medication_row_from_catalog(matches.iloc[0], day_supply=60, tier_family="generic")
     assert new_row["drug_name"] == "insulin glargine"
     assert new_row["rxcui"] == "222222"
     assert new_row["day_supply"] == 60
+    assert new_row["tier_family"] == "brand"
 
     updated_rows = append_medication_row([], new_row)
     assert len(updated_rows) == 1
     assert updated_rows[0]["ndc"] == "00000000002"
+
+
+def test_what_if_scenario_helpers_build_summary():
+    profile = ProfileInput(
+        persona="Counselor",
+        zipcode="43004",
+        age_band="65-74",
+        lis_status="none",
+        pharmacy_preference="auto",
+        chronic_condition_flags=["diabetes"],
+        top_n=5,
+    )
+    preferences = PreferenceWeights(
+        primary_goal="Balanced recommendation",
+        minimum_coverage_pct=90.0,
+        allow_comparison_plans=False,
+        max_comparison_distance_miles=50,
+        ranking_mode="rules",
+    )
+
+    scenarios = build_what_if_scenarios(profile, preferences, has_medications=True)
+    scenario_keys = {scenario.key for scenario in scenarios}
+
+    assert {"pharmacy_retail", "pharmacy_mail", "lis_partial", "lis_full"}.issubset(scenario_keys)
+    assert "goal_lowest_annual_cost" in scenario_keys
+
+    lowest_cost_scenario = next(item for item in scenarios if item.key == "goal_lowest_annual_cost")
+    assert lowest_cost_scenario.preferences.primary_goal == "Lowest annual cost"
+    assert lowest_cost_scenario.preferences.minimum_coverage_pct == 85.0
+
+    baseline_frame = recommendations_to_dataframe(
+        [
+            _sample_recommendation(
+                plan_key="P1",
+                plan_name="Alpha Choice",
+                annual_total_cost=1200.0,
+                annual_premium=360.0,
+                annual_drug_oop=840.0,
+            )
+        ],
+        run_id="baseline123",
+        minimum_coverage_pct=90.0,
+    )
+    scenario_frame = recommendations_to_dataframe(
+        [
+            _sample_recommendation(
+                plan_key="P3",
+                plan_name="Gamma Nearby",
+                annual_total_cost=1100.0,
+                annual_premium=240.0,
+                annual_drug_oop=860.0,
+            )
+        ],
+        run_id="scenario123",
+        minimum_coverage_pct=90.0,
+    )
+    mail_scenario = next(item for item in scenarios if item.key == "pharmacy_mail")
+
+    summary_frame = build_what_if_summary_frame(baseline_frame, [(mail_scenario, scenario_frame)])
+    finding = summarize_what_if_findings(summary_frame)
+
+    assert list(summary_frame.columns) == [
+        "Scenario",
+        "Assumption change",
+        "Top plan",
+        "Top plan changed",
+        "Estimated annual total cost",
+        "Delta vs baseline top plan",
+        "Estimated annual OOP",
+        "Coverage percent",
+        "Priced medications",
+        "Channel switches",
+        "Recommendation tier",
+        "Ranking source",
+    ]
+    assert summary_frame.iloc[0]["Scenario"] == mail_scenario.label
+    assert summary_frame.iloc[0]["Top plan"] == "Gamma Nearby"
+    assert summary_frame.iloc[0]["Top plan changed"] == "Changed"
+    assert summary_frame.iloc[0]["Delta vs baseline top plan"] == -100.0
+    assert "changed the top eligible plan" in finding
+
 
 
 def test_decision_support_exports_and_counselor_note():
@@ -390,14 +586,25 @@ def test_decision_support_exports_and_counselor_note():
     assert eligible_frame.iloc[0]["recommendation_tier"] == "Ready to shortlist"
     assert comparison_frame.iloc[0]["eligibility_status"].startswith("Comparison only")
     assert bool(comparison_frame.iloc[0]["comparison_only"]) is True
+    assert eligible_frame.iloc[0]["contract_year"] == 2025
+    assert eligible_frame.iloc[0]["benefit_design"] == "2025_redesign"
+    assert eligible_frame.iloc[0]["priced_drug_count"] == 1
+    assert eligible_frame.iloc[0]["channel_switch_count"] == 0
+    assert eligible_frame.iloc[0]["simulation_policy"] == "cost_realism_v1"
 
     side_by_side = build_side_by_side_frame(combined, selected_plan_keys=["P1", "P3"])
     assert list(side_by_side.columns) == ["Metric", "Alpha Choice", "Gamma Nearby"]
     assert "Annual total cost" in side_by_side["Metric"].tolist()
+    assert "Priced medications" in side_by_side["Metric"].tolist()
+    assert "Channel switches" in side_by_side["Metric"].tolist()
+    assert "Channel mix" in side_by_side["Metric"].tolist()
 
     feature_coverage = summarize_feature_coverage(eligible_recommendations, comparison_recommendations)
     assert feature_coverage["candidate_plans"] == 3
     assert feature_coverage["comparison_only_plans"] == 1
+    assert feature_coverage["contract_years"] == [2025]
+    assert feature_coverage["benefit_designs"] == ["2025_redesign"]
+    assert feature_coverage["simulation_policies"] == ["cost_realism_v1"]
 
     profile = ProfileInput(
         persona="Counselor",
@@ -441,7 +648,132 @@ def test_decision_support_exports_and_counselor_note():
     assert audit.run_id == "run123"
     assert audit.data_snapshot == "2025-Q3"
     assert len(audit.top_k_outputs) == 3
-    assert {"PLAN_KEY", "PLAN_NAME", "eligibility_status"}.issubset(audit.top_k_outputs[0])
+    assert {
+        "PLAN_KEY",
+        "PLAN_NAME",
+        "eligibility_status",
+        "scenario_profile",
+        "match_review_required",
+        "unsafe_reasons",
+        "contract_year",
+        "benefit_design",
+        "priced_drug_count",
+        "channel_switch_count",
+        "simulation_policy",
+        "selected_channel_mix",
+    }.issubset(audit.top_k_outputs[0])
     assert "Alpha Choice" in note
+    assert "stable pharmacy channel pattern" in note
     assert "comparison-only" in note
     assert any("Hybrid reranker score not available" in gap for gap in gaps)
+
+
+def test_recommendation_bundle_serializers_keep_grouped_sections():
+    full_recommendation = _sample_recommendation(
+        plan_key="H1000001000",
+        plan_name="Alpha Choice",
+        annual_total_cost=900.0,
+        annual_premium=360.0,
+        annual_drug_oop=540.0,
+    )
+    comparison_recommendation = _sample_recommendation(
+        plan_key="S2000001000",
+        plan_name="Beta Saver",
+        annual_total_cost=980.0,
+        annual_premium=420.0,
+        annual_drug_oop=560.0,
+        comparison_only=True,
+    )
+    bundle = RecommendationBundle(
+        summary=RecommendationBundleSummary(
+            requested_drug_count=2,
+            local_candidate_plan_count=7,
+            local_full_coverage_count=1,
+            local_partial_count=6,
+            fallback_reason="none",
+            scenario_profile="insulin_chronic",
+            candidate_plan_count_service_area=7,
+            candidate_plan_count_ranked=7,
+            plans_with_unknown_network_count=0,
+        ),
+        full_coverage_plans=[full_recommendation],
+        partial_fallback_plans=[],
+        comparison_only_plans=[comparison_recommendation],
+        blocked_medications=[
+            BlockedMedication(
+                medication_id="med_1",
+                requested_drug_name="insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+                resolved_drug_name="insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+                ndc="83257001111",
+                rxcui="2563977",
+                local_coverable_plan_count=0,
+                blocker_type="never_local_coverable",
+            )
+        ],
+        alternative_search_terms=[
+            AlternativeSearchTerm(
+                medication_id="med_1",
+                requested_drug_name="insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+                resolved_drug_name="insulin glargine-yfgn 100 UNT/ML Injectable Solution [Semglee]",
+                search_term="insulin glargine-yfgn",
+            )
+        ],
+    )
+
+    frames = recommendation_bundle_to_dataframes(bundle, run_id="bundle123", minimum_coverage_pct=100.0)
+
+    assert frames["summary"].iloc[0]["local_full_coverage_count"] == 1
+    assert frames["summary"].iloc[0]["scenario_profile"] == "insulin_chronic"
+    assert frames["full_coverage_plans"].iloc[0]["PLAN_KEY"] == "H1000001000"
+    assert bool(frames["comparison_only_plans"].iloc[0]["comparison_only"]) is True
+    assert frames["blocked_medications"].iloc[0]["blocker_type"] == "never_local_coverable"
+    assert frames["alternative_search_terms"].iloc[0]["search_term"] == "insulin glargine-yfgn"
+
+    payload = recommendation_bundle_to_public_payload(bundle, run_id="bundle123", minimum_coverage_pct=100.0)
+
+    assert payload["summary"]["fallback_reason"] == "none"
+    assert payload["summary"]["scenario_profile"] == "insulin_chronic"
+    assert payload["full_coverage_plans"][0]["PLAN_NAME"] == "Alpha Choice"
+    assert payload["blocked_medications"][0]["medication_id"] == "med_1"
+
+
+def test_build_side_by_side_frame_includes_tradeoff_columns():
+    frame = recommendations_to_dataframe(
+        [
+            _sample_recommendation(
+                plan_key="H1000001000",
+                plan_name="Alpha Choice",
+                annual_total_cost=900.0,
+                annual_premium=360.0,
+                annual_drug_oop=540.0,
+            ),
+            _sample_recommendation(
+                plan_key="S2000001000",
+                plan_name="Beta Saver",
+                annual_total_cost=980.0,
+                annual_premium=420.0,
+                annual_drug_oop=560.0,
+                uncovered_drug_count=1,
+                restriction_count=1,
+                network_flag="limited_preferred_retail",
+            ),
+        ],
+        run_id="sidebyside",
+        minimum_coverage_pct=100.0,
+    )
+
+    side_by_side = build_side_by_side_frame(frame, ["H1000001000", "S2000001000"])
+    metrics = set(side_by_side["Metric"].tolist())
+
+    assert {
+        "Annual total cost",
+        "Annual premium",
+        "Annual drug OOP",
+        "Coverage percent",
+        "Uncovered drugs",
+        "Restriction summary",
+        "Network flag",
+        "Preferred distance",
+        "Channel mix",
+        "Channel switches",
+    }.issubset(metrics)
