@@ -14,6 +14,7 @@ related_sources:
   - "[[Source - Plan Selection and Decision Support Evidence]]"
   - "[[Source - Part D Operations, Enrollment, and Bidding Guidance]]"
   - "[[Source - Medicare Communication and Beneficiary Readability]]"
+  - "[[Source - Reviewer Literature Expansion and Scientific Reliability]]"
   - "[[PDF Intake Register]]"
 ---
 
@@ -26,6 +27,8 @@ Plan Finder and CMS pricing files are the operational tools and data sources use
 - Counseling sources in the vault describe Plan Finder as the practical tool used to compare plans using the beneficiary's drug list and pharmacy details.
 - The PDF evidence shows that beneficiaries often struggle to interpret plan detail pages, annual cost implications, and drug restrictions even when Plan Finder narrows the option set.
 - Decision-support research suggests beneficiaries make better choices when guidance is simpler, more transparent, and closer to expert recommendations.
+- The reviewer literature expansion adds stronger evidence for this point: randomized and experimental studies support simplified cost displays and expert-like recommendations, while survey evidence after 2024 open enrollment shows that many beneficiaries still do not actively compare plans.
+- GAO's Plan Finder oversight report is useful for manuscript reliability because it shows that even official comparison outputs require pricing-data checks, sponsor correction opportunities, and usability feedback loops.
 - Administrative-data research cited in the vault suggests that fewer than 10 percent of beneficiaries ended up in ex post cost-optimal plans and that average losses relative to a Plan Finder-like static rule were about $300 per year.
 - The newer Avalere interviews add a redesign-era workflow requirement: Plan Finder should show monthly costs under the IRA redesign, incorporate payment smoothing, flag year-over-year formulary tier changes, preserve saved comparisons, and better support caregiver and SHIP use.
 - The CMS data-access page clarifies that the plan, formulary, pharmacy network, beneficiary cost, geographic locator, and quarterly pricing tables are the core operational files behind Part D analysis.
@@ -61,6 +64,7 @@ This concept connects raw CMS data and public tools to the practical question a 
 - [[Source - Plan Selection and Decision Support Evidence]]
 - [[Source - Part D Operations, Enrollment, and Bidding Guidance]]
 - [[Source - Medicare Communication and Beneficiary Readability]]
+- [[Source - Reviewer Literature Expansion and Scientific Reliability]]
 - [[PDF Intake Register]]
 - [[Study - URL Package Processing Tracker]]
 - [[Topic - SHIP Counseling and Plan Navigation]]

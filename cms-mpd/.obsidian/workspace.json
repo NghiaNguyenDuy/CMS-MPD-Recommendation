@@ -4,35 +4,21 @@
     "type": "split",
     "children": [
       {
-        "id": "ced6afe34f540397",
+        "id": "0a152d17d62e20a8",
         "type": "tabs",
         "children": [
           {
-            "id": "b1e89a58c5303897",
+            "id": "18a00c44c5f9f22e",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "05 Outputs/Summaries/CMS MPD Recommendation - Research Flow, Data Logic, and Algorithm.md",
-                "mode": "preview",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "CMS MPD Recommendation - Research Flow, Data Logic, and Algorithm"
-            }
-          },
-          {
-            "id": "eebf0e52983bb12b",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "05 Outputs/Summaries/CMS MPD Recommendation - Data Lineage Table.md",
+                "file": "01 Inbox/References/URLs package.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "CMS MPD Recommendation - Data Lineage Table"
+              "title": "URLs package"
             }
           }
         ]
@@ -92,7 +78,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 468.5
+    "width": 501.5
   },
   "right": {
     "id": "5dc2e687f45aeae6",
@@ -108,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "05 Outputs/Summaries/CMS MPD Recommendation - Journal Manuscript Draft.md",
+                "file": "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -118,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for CMS MPD Recommendation - Journal Manuscript Draft"
+              "title": "Backlinks for CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft"
             }
           },
           {
@@ -197,43 +183,43 @@
       "bases:Create new base": false
     }
   },
-  "active": "b1e89a58c5303897",
+  "active": "18a00c44c5f9f22e",
   "lastOpenFiles": [
-    "05 Outputs/Summaries/CMS MPD Recommendation - Data Lineage Table.md",
-    "05 Outputs/Summaries/CMS MPD Recommendation - Research Flow, Data Logic, and Algorithm.md",
+    "01 Inbox/Articles/Using an Online Decision Aid to Help Medicare Beneficiaries Choose a Prescription Drug Plan.md",
+    "01 Inbox/Articles/Medicare Part D Plans Rarely Cover Brand-Name Drugs When.md",
+    "01 Inbox/Web Imports/Key Facts About Medicare Drug Price Negotiation.md",
+    "01 Inbox/Web Imports/Insulin Out-of-Pocket Costs in Medicare Part D.md",
+    "01 Inbox/Web Imports/2027 Part D Application Final.md",
+    "01 Inbox/Web Imports/2027 Medicare Advantage and Part D Advance Notice.md",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft.md",
+    "05 Outputs/Manuscripts/~$S MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - native IEEE citations.docx",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - native IEEE citations.tmp.docx",
+    "05 Outputs/Manuscripts/~WRL0716.tmp",
+    "05 Outputs/Manuscripts/~WRD0498.tmp",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - native IEEE citations.docx",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Peer Review Integrated Draft 2026-05-01.md",
+    "99 Archive/CMS MPD Manuscript - CMPB Update - 2026-05-01.md",
+    "05 Outputs/Manuscripts/~$S MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Peer Review Integrated Draft 2026-05-01.docx",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Peer Review Integrated Draft 2026-05-01.docx",
+    "99 Archive/CMS MPD Figure 3 - Overall Research Flow.drawio",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - Shortened 2026-05-01.docx",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - Shortened 2026-05-01.md",
+    "05 Outputs/Manuscripts/chatgpt-peer-review.md",
+    "05 Outputs/Manuscripts/deep-research-report.md.crdownload",
+    "05 Outputs/Manuscripts/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft - Shortened 2026-05-01.md",
     "05 Outputs/Summaries/CMS MPD Specific Prescription Case Illustrations.md",
-    "05 Outputs/Summaries/CMS MPD CY2025 Enrollment Workflow and Case Comparison.md",
-    "05 Outputs/Summaries/CMS MPD Counselor Narrative Case Studies.md",
-    "05 Outputs/Summaries/CMS MPD Recommendation - Journal Manuscript Draft.md",
-    "05 Outputs/Summaries/CMS MPD Time-Based Prescription Cost Case Studies.md",
     "05 Outputs/Summaries/CMS MPD Source Processing Summary - 2026-04-07.md",
-    "99 Archive/CMS MPD Recommendation - Research Flow, Data Logic, and Algorithm - pre-full-coverage-shortlist-sync-2026-04-08.md",
-    "99 Archive/Untitled.md",
-    "99 Archive/CMS MPD Recommendation - Journal Manuscript Draft - pre-official-cms-sources-2026-04-08.md",
-    "99 Archive/CMS MPD Recommendation - Journal Manuscript Draft - pre-standalone-cleanup-2026-04-08.md",
-    "99 Archive/CMS MPD Recommendation - Journal Manuscript Draft - pre-rebuttal-2026-04-06.md",
-    "99 Archive/CMS MPD Recommendation - Journal Manuscript Draft - pre-direct-citations-2026-04-08.md",
-    "05 Outputs/Summaries/CMS MPD Recommendation - Research Manuscript Draft.md",
-    "05 Outputs/Analytics/CMS MPD Analytics Dashboard.md",
-    "05 Outputs/Analytics/CMS MPD Analytics.base",
-    "02 Source Notes/Source - Part D Reform and IRA Timeline.md",
-    "01 Inbox/Untitled.md",
-    "01 Inbox/Web Imports/SSA - POMS HI 03001.005 - Medicare Part D Extra Help (Low-Income Subsidy or LIS).md",
-    "02 Source Notes/Source - Extra Help and LIS Operations.md",
-    "materials/PDFs/CMA.PAN_.IRA_.2025.pdf",
-    "02 Source Notes/Source - Plan Selection and Decision Support Evidence.md",
-    "02 Source Notes/Source - SHIP Counseling and Beneficiary Navigation.md",
-    "02 Source Notes/Source - Medicare Communication and Beneficiary Readability.md",
-    "01 Inbox/Web Imports/Everything you need to know about Medicare reforms.md",
-    "01 Inbox/Web Imports/Medicare Part D Improvements.md",
-    "04 Study Notes/Study Queue.md",
-    "materials/PDFs/Heiss_20121031.pdf",
-    "materials/PDFs/Planning-Ahead-Recommendations-for-Plan-Finder.pdf",
-    "materials/PDFs/Heiss_20121031.pdf.crdownload",
-    "materials/PDFs/mar20_medpac_ch14_sec.pdf",
-    "materials/PDFs/mar20_medpac_ch14_sec.pdf.crdownload",
-    "materials/PDFs/CY2025 Part D BPT Instructions_2024_04_05.pdf",
-    "materials/PDFs/CY2025 Part D BPT Instructions_2024_04_05.pdf.crdownload",
-    "materials/PDFs/hpms-memo-cy-2025-enrollment-form-5-6-2025_508.pdf"
+    "05 Outputs/Summaries/CMS MPD Simulated Cost Calculation and Recommendation Flow - Sample.md",
+    "05 Outputs/Manuscripts/CMS MPD Journal Alignment and Submission Checklist.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Revision.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft 1 1.md",
+    "05 Outputs/Summaries/CMS MPD Ranking Models, Evaluation Metrics, and Cost Simulation - Technical Explanation.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft 2026-04-25.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft 24-04-2026 1.md",
+    "99 Archive/CMS MPD Manuscript - Computer Methods and Programs in Biomedicine Update - Reviewer Revision Draft 24-4-2026.md",
+    "02 Source Notes/Source - Reviewer Literature Expansion and Scientific Reliability.md",
+    "03 Topic Notes/Topic - Manuscript Scientific Reliability Evidence Map.md"
   ]
 }

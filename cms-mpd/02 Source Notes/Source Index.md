@@ -27,6 +27,7 @@ Use this note as the reviewed-source landing page for the current Medicare plan 
 - [[Source - Dual-Eligible Access to Drugs Under Part D]]
 - [[Source - Biosimilar Coverage and Part D Spending]]
 - [[Source - GLP-1 Coverage Use and Fiscal Pressure]]
+- [[Source - Reviewer Literature Expansion and Scientific Reliability]]
 - [[PDF Intake Register]]
 
 ## Source Categories
@@ -45,6 +46,7 @@ Use this note as the reviewed-source landing page for the current Medicare plan 
 - Dual-eligible access and beneficiary protections
 - Biosimilar competition and biologic spending
 - GLP-1 use, obesity coverage, and fiscal pressure
+- Reviewer-focused manuscript evidence expansion and scientific reliability
 
 ## Tracking Prompts
 

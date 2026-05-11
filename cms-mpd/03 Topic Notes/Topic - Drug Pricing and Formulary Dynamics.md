@@ -17,6 +17,7 @@ related_sources:
   - "[[Source - Part D Insurer Incentives and Market Design]]"
   - "[[Source - Biosimilar Coverage and Part D Spending]]"
   - "[[Source - GLP-1 Coverage Use and Fiscal Pressure]]"
+  - "[[Source - Reviewer Literature Expansion and Scientific Reliability]]"
 ---
 
 # Definition
@@ -42,6 +43,7 @@ Drug pricing and formulary dynamics are the set of forces that turn list prices,
 - OIG's 2025 diabetes-drug brief shows that a small set of high-spend drugs can grow much faster than overall Part D enrollment, which helps explain why formulary policy, negotiation, and fiscal oversight increasingly overlap.
 - MedPAC's DIR presentation shows that rebate levels vary sharply across drug classes and organizational structures, which helps explain why net prices, list prices, and beneficiary-facing prices can move differently.
 - Pricing files and benchmarking tools such as NADAC can expose large variation across plans for the same product.
+- The reviewer literature expansion adds post-IRA plan-design evidence showing that deductibles, coinsurance, premiums, formulary size, and coverage-option structure can shift after the 2025 redesign, which makes quarter-specific artifacts methodologically necessary.
 
 ## Why It Matters
 
@@ -67,5 +69,6 @@ Without this concept, it is easy to misread plan materials and think that brand 
 - [[Source - Part D Insurer Incentives and Market Design]]
 - [[Source - Biosimilar Coverage and Part D Spending]]
 - [[Source - GLP-1 Coverage Use and Fiscal Pressure]]
+- [[Source - Reviewer Literature Expansion and Scientific Reliability]]
 - [[Topic - Insulin Affordability in Part D]]
 - [[Topic - Plan Finder and CMS Pricing Files]]
